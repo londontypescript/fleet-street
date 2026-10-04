@@ -22,8 +22,13 @@ the row never looks empty.
   - Left: the git branch, green on the main branch and yellow on any other
   - Middle, while subagents are running: `agents`, each with its model, tokens used and how long it has run
   - Middle, while background tasks are running: `bg`, each with how long it has run
-  - Middle, when neither is running: the date and time, with a faint dot on each side
+  - Middle, when neither is running: the date and time
   - Right: `time`, how long the session has been running
+- **Row 3: recent sessions**: this project's three most recently active other sessions in the desktop app,
+  each in its own box with its title and how long ago it was last active. Clicking a title opens that session.
+  `/toggle-sessions` hides or shows the row. The sessions are read from the desktop app's data folder
+  (`%APPDATA%\Claude` on Windows, `~/Library/Application Support/Claude` on macOS, `~/.config/Claude` on
+  Linux); on a machine without the desktop app the row is not drawn.
 
 Bars and percentages go green, yellow, then red as usage rises. After a long gap, a prompt asks whether to
 keep the session timer going.
@@ -53,6 +58,13 @@ Set in the plugin's config:
 | --- | --- | --- |
 | `awayMinutes` | `30` | Minutes without activity before the banner asks whether to keep the session timer going |
 | `mainBranch` | `main` | The branch shown in green; any other branch is shown in yellow |
+| `showSessions` | `true` | Show the row of this project's recent sessions |
+
+## Commands
+
+- `/reset-timer` restarts the session timer.
+- `/toggle-sessions` hides or shows the recent-sessions row for the current session, whatever
+  `showSessions` says.
 
 ## Develop
 
