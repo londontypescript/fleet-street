@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
-import type { Away, BgTask, Context, Limit, Subagent } from '../types'
+import type { Away, BgTask, Context, Limit, RecentSession, Subagent } from '../types'
 
 const limits = atom({ plugin: 'fleet-street', key: 'limits' } as const, [] as Limit[])
 const context = atom({ plugin: 'fleet-street', key: 'context' } as const, null as Context | null)
@@ -14,6 +14,12 @@ const subagents = atom({ plugin: 'fleet-street', key: 'subagents' } as const, []
 const bgTasks = atom({ plugin: 'fleet-street', key: 'bgTasks' } as const, [] as BgTask[])
 // The session folder's branch, `@<hash>` on a detached HEAD, null outside a git repository.
 const branch = atom({ plugin: 'fleet-street', key: 'branch' } as const, null as string | null)
+
+// The three most recently updated other sessions of this project, newest first; null until a scan
+// finds the desktop app's session records (never, on a machine without the desktop app).
+const recent = atom({ plugin: 'fleet-street', key: 'recent' } as const, null as RecentSession[] | null)
+// This session's choice from /toggle-sessions; null follows the showSessions option.
+const sessionsShown = atom({ plugin: 'fleet-street', key: 'sessionsShown' } as const, null as boolean | null)
 
 // The session timer's start lives in the store too, keyed by session, so a resume carries on counting.
 const timerKey = async ($: EngineInterface) => `timer:${await $.session.id()}`
@@ -45,6 +51,18 @@ const fmtDuration = (ms: number) => {
   if (d > 0) return `${d}d${h}h`
   if (h > 0) return `${h}h${String(m).padStart(2, '0')}m`
   return `${m}:${String(s % 60).padStart(2, '0')}`
+}
+
+// Time until a limit resets, to the minute and rounded up: 33m, 3h46m, 6d16h. Never seconds, as the
+// banner redraws these once a minute.
+const fmtReset = (ms: number) => {
+  const total = Math.max(0, Math.ceil(ms / 60_000))
+  const d = Math.floor(total / 1440)
+  const h = Math.floor((total % 1440) / 60)
+  const m = total % 60
+  if (d > 0) return `${d}d${h}h`
+  if (h > 0) return `${h}h${String(m).padStart(2, '0')}m`
+  return `${m}m`
 }
 
 // Whole minutes, as 47m or 2h05m.
@@ -116,6 +134,151 @@ async function endTasksIn($: EngineInterface, text: string) {
   if (ids.size > 0) await setBgTasks($, list => list.filter(b => !ids.has(b.id)))
 }
 
+const RECENT_COUNT = 3
+// 4m, 3h, 2d: at most three characters, so the row's title budget stays predictable.
+const fmtAgo = (ms: number) => {
+  const m = Math.floor(Math.max(0, ms) / 60_000)
+  if (m < 1) return 'now'
+  if (m < 60) return `${m}m`
+  const h = Math.floor(m / 60)
+  return h < 24 ? `${h}h` : `${Math.min(99, Math.floor(h / 24))}d`
+}
+
+const truncate = (text: string, max: number) =>
+  max <= 0 ? '' : text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…`
+
+// Each recent session's cell takes the same share of the row; the gaps between them take the rest.
+const CELL_PERCENT = 32
+// A cell's frame: a rounded border and a column of padding on each side.
+const CELL_FRAME = 4
+
+// What one desktop session record says, kept until the file changes.
+type SessionRecord = {
+  id: string
+  cliId?: string
+  title: string
+  updatedAt: number
+  dirs: string[]
+  archived: boolean
+}
+const records = new Map<string, { mtimeMs: number; record: SessionRecord | null }>()
+const realPaths = new Map<string, string | null>()
+
+const realPath = async ($: EngineInterface, path: string) => {
+  if (!realPaths.has(path)) {
+    const stat = await $.fs.stat(path, { resolve: true }).catch(() => undefined)
+    realPaths.set(path, stat?.realPath ?? null)
+  }
+  return realPaths.get(path) ?? null
+}
+
+const parseRecord = (text: string): SessionRecord | null => {
+  try {
+    const s = JSON.parse(text)
+    const at = s.lastActivityAt ?? s.createdAt
+    if (typeof s.sessionId !== 'string' || !at) return null
+    return {
+      id: s.sessionId,
+      cliId: typeof s.cliSessionId === 'string' ? s.cliSessionId : undefined,
+      title: String(s.title || 'Untitled').split(/\s+/).filter(Boolean).join(' '),
+      updatedAt: Number(at),
+      dirs: [s.originCwd, s.cwd].filter((d): d is string => typeof d === 'string' && d !== ''),
+      archived: Boolean(s.isArchived),
+    }
+  } catch {
+    return null
+  }
+}
+
+type DesktopOs = 'windows' | 'macos' | 'linux'
+type SessionsRoot = { os: DesktopOs; path: string }
+
+// Where the desktop app keeps its session records: its Electron data folder, which each OS places
+// differently, then claude-code-sessions. The plugin API names no OS, so each candidate is tried in
+// turn; null when none exists (no desktop app on this machine).
+async function findSessionsRoot($: EngineInterface): Promise<SessionsRoot | null> {
+  const appData = await $.env.get('APPDATA')
+  const home = await $.env.get('HOME')
+  const xdg = await $.env.get('XDG_CONFIG_HOME')
+  const candidates: SessionsRoot[] = []
+  if (appData) candidates.push({ os: 'windows', path: `${appData}/Claude` })
+  if (home) candidates.push({ os: 'macos', path: `${home}/Library/Application Support/Claude` })
+  if (xdg || home) candidates.push({ os: 'linux', path: `${xdg || `${home}/.config`}/Claude` })
+  for (const c of candidates) {
+    const path = `${c.path}/claude-code-sessions`
+    if (await $.fs.exists(path)) return { os: c.os, path }
+  }
+  return null
+}
+
+let sessionsRoot: SessionsRoot | null | undefined
+
+// Windows paths compare without regard to case or slash direction.
+const samePath = (os: DesktopOs, a: string, b: string) =>
+  os === 'windows' ? a.replace(/\\/g, '/').toLowerCase() === b.replace(/\\/g, '/').toLowerCase() : a === b
+
+// The desktop app's own session records (<root>/<account>/<org>/local_*.json), scanned for this
+// folder's latest unarchived sessions other than this one. Only files changed since the last scan
+// are read again. With no desktop app the list is null and the row is not drawn.
+async function refreshRecent($: EngineInterface) {
+  if (sessionsRoot === undefined || sessionsRoot === null) sessionsRoot = await findSessionsRoot($)
+  if (sessionsRoot === null) {
+    if ((await read($, recent)) !== null) await update($, recent, () => null)
+    return
+  }
+  const { os, path: root } = sessionsRoot
+  const folder = await realPath($, await $.session.root())
+  const current = await $.session.id()
+  const dirsOf = async (path: string) =>
+    (await $.fs.list(path).catch(() => [])).filter(d => d.kind === 'dir').map(d => `${path}/${d.name}`)
+
+  const found: RecentSession[] = []
+  const seen = new Set<string>()
+  for (const account of await dirsOf(root)) {
+    for (const org of await dirsOf(account)) {
+      for (const f of await $.fs.list(org).catch(() => [])) {
+        if (f.kind !== 'file' || !/^local_.*\.json$/.test(f.name)) continue
+        const path = `${org}/${f.name}`
+        seen.add(path)
+        let cached = records.get(path)
+        if (!cached || cached.mtimeMs !== f.mtimeMs) {
+          const text = await $.fs.read(path).catch(() => null)
+          cached = { mtimeMs: f.mtimeMs, record: text === null ? null : parseRecord(text) }
+          records.set(path, cached)
+        }
+        const r = cached.record
+        if (!r || r.archived || (r.cliId !== undefined && r.cliId === current)) continue
+        let here = false
+        for (const d of r.dirs) {
+          const real = await realPath($, d)
+          if (real !== null && folder !== null && samePath(os, real, folder)) here = true
+        }
+        if (here) found.push({ id: r.id, title: r.title, updatedAt: r.updatedAt, link: `claude://claude.ai/epitaxy/${r.id}` })
+      }
+    }
+  }
+  for (const path of records.keys()) if (!seen.has(path)) records.delete(path)
+
+  const next = found.sort((a, b) => b.updatedAt - a.updatedAt).slice(0, RECENT_COUNT)
+  const key = (list: RecentSession[] | null) => (list ?? []).map(r => `${r.id}|${r.title}|${r.updatedAt}`).join()
+  const shown = await read($, recent)
+  if (shown === null || key(next) !== key(shown)) await update($, recent, () => next)
+}
+
+// Sessions open through the desktop app's deep link, handed to the OS's own opener.
+const OPENERS: Record<DesktopOs, (link: string) => string[]> = {
+  macos: link => ['open', link],
+  // Not `cmd /c start`, whose quoting of an empty title argument does not survive being passed as an argv.
+  windows: link => ['rundll32', 'url.dll,FileProtocolHandler', link],
+  linux: link => ['xdg-open', link],
+}
+
+const openSession = async ($: EngineInterface, link: string) => {
+  if (!sessionsRoot) return
+  const ran = await $.process.run(OPENERS[sessionsRoot.os](link)).catch(err => ({ exitCode: 1, stderr: String(err) }))
+  if (ran.exitCode !== 0) $.ui.toast(`Could not open session: ${ran.stderr.slice(0, 80)}`)
+}
+
 let branchShown: string | null | undefined
 
 async function refreshBranch($: EngineInterface) {
@@ -164,6 +327,7 @@ async function pruneSubagents($: EngineInterface) {
 export const register: Register = (on, options) => {
   const awayMs = Number(options.awayMinutes ?? 30) * 60_000
   const mainBranch = String(options.mainBranch ?? 'main')
+  const showSessions = options.showSessions !== false
   // Mirrors of state the timer needs, so it can decide whether a redraw would change anything.
   let lastAt: number | null = null
   let ttl = TTL_API_MS
@@ -187,11 +351,17 @@ export const register: Register = (on, options) => {
     subagentCount = (await read($, subagents)).length
     bgCount = (await read($, bgTasks)).length
     await $.command.register({ name: 'reset-timer', description: 'Restart the session timer in the fleet-street banner' })
+    await $.command.register({
+      name: 'toggle-sessions',
+      description: 'Hide or show the recent-sessions row in the fleet-street banner for this session',
+    })
     void refreshBranch($)
+    void refreshRecent($).catch(err => $.ui.log(`fleet-street: recent sessions failed: ${err}`))
     $.clock.every(1000, () => {
       const t = Date.now()
       // A checkout made outside the session (another terminal) shows within five seconds.
       if (Math.floor(t / 1000) % 5 === 0) void refreshBranch($)
+      if (Math.floor(t / 1000) % 15 === 0) void refreshRecent($).catch(() => {})
       // A subagent that was stopped may never report its end; drop any the engine no longer runs.
       if (subagentCount > 0 && Math.floor(t / 1000) % 10 === 0) void pruneSubagents($)
       const left = lastAt === null ? Infinity : lastAt + ttl - t
@@ -207,6 +377,12 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'reset-timer' }, async $ => {
     await setTimer($, Date.now())
     return { text: 'Session timer restarted.' }
+  })
+
+  on('command.run', { command: 'toggle-sessions' }, async $ => {
+    const shown = !((await read($, sessionsShown)) ?? showSessions)
+    await update($, sessionsShown, () => shown)
+    return { text: shown ? 'Recent sessions shown.' : 'Recent sessions hidden.' }
   })
 
   on('prompt.submit', async ($, e, next) => {
@@ -354,13 +530,15 @@ export const register: Register = (on, options) => {
     const agents = await read($, subagents)
     const onBranch = await read($, branch)
     const bg = await read($, bgTasks)
+    const sessions = await read($, recent)
+    const sessionsOn = (await read($, sessionsShown)) ?? showSessions
 
     // Spacing comes from Box gaps, not spaces inside Text: the desktop surface trims those.
     const sep = <Text dimColor>│</Text>
     const parts: RenderChildren[] = []
 
     for (const l of ls) {
-      const reset = l.resetsAt ? fmtDuration(Date.parse(l.resetsAt) - t) : null
+      const reset = l.resetsAt ? fmtReset(Date.parse(l.resetsAt) - t) : null
       const filled = filledCells(l.percentUsed)
       parts.push(
         <Box columnGap={1}>
@@ -530,22 +708,8 @@ export const register: Register = (on, options) => {
     const middleParts = [agentPart, bgPart].filter(p => p !== null)
     // With no agents or background tasks the middle shows the date and time, if it fits between the sides.
     const clockText = middleParts.length === 0 && t > 0 ? fmtClock(t) : null
-    // A small faint dot sits in the middle of the space on each side of the clock: the two outer boxes
-    // share what is left equally and centre their dot. Dots are one character, so nothing can overflow.
     const clockPart =
-      clockText !== null && 2 * sideWidth + 2 + clockText.length + 4 <= e.props.bodyColumns ? (
-        <Box width="100%" flexWrap="nowrap">
-          <Box flexGrow={1} flexShrink={1} justifyContent="center">
-            <Text dimColor>•</Text>
-          </Box>
-          <Box flexShrink={0}>
-            <Text dimColor>{clockText}</Text>
-          </Box>
-          <Box flexGrow={1} flexShrink={1} justifyContent="center">
-            <Text dimColor>•</Text>
-          </Box>
-        </Box>
-      ) : clockText !== null && 2 * sideWidth + 2 + clockText.length <= e.props.bodyColumns ? (
+      clockText !== null && 2 * sideWidth + 2 + clockText.length <= e.props.bodyColumns ? (
         <Text dimColor>{clockText}</Text>
       ) : null
     if (clockPart) middleParts.push(clockPart)
@@ -564,7 +728,42 @@ export const register: Register = (on, options) => {
         </Box>
       ) : null
 
-    if (!awayLine && !agentLine) {
+    // Recent sessions: three equal rounded cells spread edge to edge, each with its title and age
+    // together in the middle. The terminal cuts a title to the cell's columns; a desktop draws a proportional
+    // font narrower than its cells, so there the cell gets the whole title and clips only true overflow.
+    const cellColumns = Math.floor((e.props.bodyColumns * CELL_PERCENT) / 100)
+    const recentLine = !sessionsOn || sessions === null ? null : sessions.length === 0 ? (
+        <Text dimColor>recent: no sessions found</Text>
+      ) : cellColumns >= 16 ? (
+        <Box width="100%" flexWrap="nowrap" justifyContent="space-between">
+          {sessions.map(s => {
+            const ago = fmtAgo(t - s.updatedAt)
+            const title = e.surface === 'terminal' ? truncate(s.title, cellColumns - CELL_FRAME - 1 - ago.length) : s.title
+            return (
+              <Box
+                key={s.id}
+                width={`${CELL_PERCENT}%`}
+                flexWrap="nowrap"
+                justifyContent="center"
+                columnGap={1}
+                borderStyle="round"
+                borderDimColor
+                hover={{ borderDimColor: false }}
+                paddingX={1}
+              >
+                <Box flexShrink={1} overflow="hidden">
+                  <Button key={`o:${s.id}`} label={title} plain dimColor onPress={() => openSession($, s.link)} />
+                </Box>
+                <Box flexShrink={0}>
+                  <Text dimColor>{ago}</Text>
+                </Box>
+              </Box>
+            )
+          })}
+        </Box>
+      ) : null
+
+    if (!awayLine && !agentLine && !recentLine) {
       return firstLine
     }
 
@@ -573,6 +772,7 @@ export const register: Register = (on, options) => {
         {firstLine}
         {awayLine}
         {agentLine}
+        {recentLine}
       </Box>
     )
   })

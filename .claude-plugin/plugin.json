@@ -16,6 +16,12 @@
       "title": "Expected branch",
       "description": "The branch shown in green; any other branch is shown in yellow as a warning",
       "default": "main"
+    },
+    "showSessions": {
+      "type": "boolean",
+      "title": "Show recent sessions",
+      "description": "Show the row of this project's recent sessions; /toggle-sessions hides or shows it for the current session",
+      "default": true
     }
   }
 }
