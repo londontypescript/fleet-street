@@ -13,17 +13,17 @@ the row never looks empty.
 
 ## What it shows
 
-| Row | Part | What it shows |
-| --- | --- | --- |
-| 1 | `5h` | 5-hour usage as a bar and a percentage, with time until it resets |
-| 1 | `week` | Weekly usage, the same way |
-| 1 | `ctx` | Context used out of the window, as tokens and a percentage |
-| 1 | `cache` | Prompt-cache countdown. It turns yellow in the last five minutes and red in the last minute |
-| 2, left | branch | The git branch: green on the main branch, yellow on any other |
-| 2, middle | `agents` | Each running subagent with its model, tokens used and how long it has run |
-| 2, middle | `bg` | Each background task with how long it has run |
-| 2, middle | date and time | Shown only when no agents or background tasks are running, with a faint dot on each side |
-| 2, right | `time` | How long the session has been running |
+- **Row 1: usage**, left to right
+  - `5h`: 5-hour usage as a bar and a percentage, with the time until it resets
+  - `week`: weekly usage, the same way
+  - `ctx`: context used out of the window, as tokens and a percentage
+  - `cache`: the prompt-cache countdown, yellow in the last five minutes and red in the last minute
+- **Row 2: status**, left to right
+  - Left: the git branch, green on the main branch and yellow on any other
+  - Middle, while subagents are running: `agents`, each with its model, tokens used and how long it has run
+  - Middle, while background tasks are running: `bg`, each with how long it has run
+  - Middle, when neither is running: the date and time, with a faint dot on each side
+  - Right: `time`, how long the session has been running
 
 Bars and percentages go green, yellow, then red as usage rises. After a long gap, a prompt asks whether to
 keep the session timer going.
