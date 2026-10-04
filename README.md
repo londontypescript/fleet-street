@@ -1,6 +1,6 @@
 # fleet-street
 
-A Claude Code mod (plugin name `usage-banner`) that draws a banner above the prompt.
+Usage and Status Banner Plugin for Claude
 
 **Row 1:** 5-hour and weekly usage bars with time to reset, context size, and a prompt-cache countdown.
 **Row 2:** git branch on the left, session timer on the right, and in the middle the running subagents and
@@ -13,14 +13,14 @@ with a small faint dot on each side.
 ./install.sh
 ```
 
-This links the repo at `~/.claude/mods/usage-banner`. If a real folder is already there, it is moved to
-`~/.claude/backups/usage-banner.<timestamp>`, never deleted. The script is safe to run again.
+This links the repo at `~/.claude/mods/fleet-street`. If a real folder is already there, it is moved to
+`~/.claude/backups/fleet-street.<timestamp>`, never deleted. The script is safe to run again.
 
 Claude Code loads the mod through `CLAUDE_CODE_PLUGIN_DIRS`. If `~/.claude/settings.json` doesn't name the
 path yet, the script prints the line to add to its `env` block:
 
 ```json
-"CLAUDE_CODE_PLUGIN_DIRS": "/Users/<you>/.claude/mods/usage-banner"
+"CLAUDE_CODE_PLUGIN_DIRS": "/Users/<you>/.claude/mods/fleet-street"
 ```
 
 Uninstall with `./install.sh --uninstall`, which removes the link and nothing else.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Link this repo into Claude Code's mods folder as the usage-banner plugin.
+# Link this repo into Claude Code's mods folder as the fleet-street plugin.
 #
-#   ./install.sh              link the repo at ~/.claude/mods/usage-banner
+#   ./install.sh              link the repo at ~/.claude/mods/fleet-street
 #   ./install.sh --uninstall  remove that link (nothing else is touched)
 #
 # CLAUDE_MODS_DIR overrides ~/.claude/mods (used for testing).
@@ -9,7 +9,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 MODS_DIR="${CLAUDE_MODS_DIR:-$HOME/.claude/mods}"
-TARGET="$MODS_DIR/usage-banner"
+TARGET="$MODS_DIR/fleet-street"
 BACKUP_DIR="$HOME/.claude/backups"
 
 resolves_to_repo() {
@@ -42,7 +42,7 @@ else
   if [ -e "$TARGET" ]; then
     # A real folder is in the way: move it aside, outside the mods folder, never delete it.
     mkdir -p "$BACKUP_DIR"
-    SAVED="$BACKUP_DIR/usage-banner.$(date +%Y%m%d-%H%M%S)"
+    SAVED="$BACKUP_DIR/fleet-street.$(date +%Y%m%d-%H%M%S)"
     mv "$TARGET" "$SAVED"
     echo "Moved the existing folder to $SAVED"
   fi

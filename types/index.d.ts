@@ -6,7 +6,7 @@ export type Subagent = { id: string; type: string; description: string; model: s
 
 declare module 'claude-code' {
   interface PluginState {
-    'usage-banner': {
+    'fleet-street': {
       limits: Limit[]
       context: Context | null
       lastResponseAt: number | null

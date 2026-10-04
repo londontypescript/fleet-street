@@ -3,17 +3,17 @@ import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
 import type { Away, BgTask, Context, Limit, Subagent } from '../types'
 
-const limits = atom({ plugin: 'usage-banner', key: 'limits' } as const, [] as Limit[])
-const context = atom({ plugin: 'usage-banner', key: 'context' } as const, null as Context | null)
-const lastResponseAt = atom({ plugin: 'usage-banner', key: 'lastResponseAt' } as const, null as number | null)
-const now = atom({ plugin: 'usage-banner', key: 'now' } as const, 0)
-const timerStart = atom({ plugin: 'usage-banner', key: 'timerStart' } as const, null as number | null)
-const away = atom({ plugin: 'usage-banner', key: 'away' } as const, null as Away | null)
-const subagents = atom({ plugin: 'usage-banner', key: 'subagents' } as const, [] as Subagent[])
+const limits = atom({ plugin: 'fleet-street', key: 'limits' } as const, [] as Limit[])
+const context = atom({ plugin: 'fleet-street', key: 'context' } as const, null as Context | null)
+const lastResponseAt = atom({ plugin: 'fleet-street', key: 'lastResponseAt' } as const, null as number | null)
+const now = atom({ plugin: 'fleet-street', key: 'now' } as const, 0)
+const timerStart = atom({ plugin: 'fleet-street', key: 'timerStart' } as const, null as number | null)
+const away = atom({ plugin: 'fleet-street', key: 'away' } as const, null as Away | null)
+const subagents = atom({ plugin: 'fleet-street', key: 'subagents' } as const, [] as Subagent[])
 // Background shells and monitors (background subagents are on the agents list already).
-const bgTasks = atom({ plugin: 'usage-banner', key: 'bgTasks' } as const, [] as BgTask[])
+const bgTasks = atom({ plugin: 'fleet-street', key: 'bgTasks' } as const, [] as BgTask[])
 // The session folder's branch, `@<hash>` on a detached HEAD, null outside a git repository.
-const branch = atom({ plugin: 'usage-banner', key: 'branch' } as const, null as string | null)
+const branch = atom({ plugin: 'fleet-street', key: 'branch' } as const, null as string | null)
 
 // The session timer's start lives in the store too, keyed by session, so a resume carries on counting.
 const timerKey = async ($: EngineInterface) => `timer:${await $.session.id()}`
@@ -186,7 +186,7 @@ export const register: Register = (on, options) => {
     lastActive = typeof active === 'number' ? active : null
     subagentCount = (await read($, subagents)).length
     bgCount = (await read($, bgTasks)).length
-    await $.command.register({ name: 'reset-timer', description: 'Restart the session timer in the usage banner' })
+    await $.command.register({ name: 'reset-timer', description: 'Restart the session timer in the fleet-street banner' })
     void refreshBranch($)
     $.clock.every(1000, () => {
       const t = Date.now()

@@ -1,5 +1,5 @@
 {
-  "name": "usage-banner",
+  "name": "fleet-street",
   "version": "0.1.0",
   "author": { "name": "Nnsée Nain" },
   "description": "Banner above the prompt: limits, context, prompt-cache countdown, session timer, git branch and running subagents",
