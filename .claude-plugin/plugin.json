@@ -1,0 +1,21 @@
+{
+  "name": "usage-banner",
+  "version": "0.1.0",
+  "author": { "name": "Nnsée Nain" },
+  "description": "Banner above the prompt: limits, context, prompt-cache countdown, session timer, git branch and running subagents",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "awayMinutes": {
+      "type": "number",
+      "title": "Away check (minutes)",
+      "description": "Minutes without activity before the banner asks whether to keep the session timer going",
+      "default": 30
+    },
+    "mainBranch": {
+      "type": "string",
+      "title": "Expected branch",
+      "description": "The branch shown in green; any other branch is shown in yellow as a warning",
+      "default": "main"
+    }
+  }
+}
