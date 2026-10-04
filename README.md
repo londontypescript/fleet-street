@@ -34,17 +34,16 @@ keep the session timer going.
 ./install.sh
 ```
 
-This links the repo at `~/.claude/mods/fleet-street`. If a real folder is already there, it is moved to
-`~/.claude/backups/fleet-street.<timestamp>`, never deleted. The script is safe to run again.
+It needs `jq`. The script does two things, then asks you to start a new Claude Code session:
 
-Claude Code loads the mod through `CLAUDE_CODE_PLUGIN_DIRS`. If `~/.claude/settings.json` doesn't name the
-path yet, the script prints the line to add to its `env` block:
+- Links the repo at `~/.claude/mods/fleet-street`. If a real folder is already there, it is moved to
+  `~/.claude/backups/fleet-street.<timestamp>`, never deleted.
+- Adds that path to `env.CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json`, which is how Claude Code
+  loads the mod. Any paths already listed there stay, separated by `:`. The file is backed up to
+  `~/.claude/backups/settings.json.<timestamp>` first.
 
-```json
-"CLAUDE_CODE_PLUGIN_DIRS": "/Users/<you>/.claude/mods/fleet-street"
-```
-
-Uninstall with `./install.sh --uninstall`, which removes the link and nothing else.
+It is safe to run again. `./install.sh --uninstall` removes the link and this one path from settings,
+and nothing else.
 
 ## Options
 
