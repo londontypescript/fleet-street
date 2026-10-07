@@ -294,7 +294,7 @@ let worktreesShown = ''
 let worktreesRun = 0
 
 // `git worktree list --porcelain`: one block per worktree, `worktree <path>` then `branch refs/heads/<name>`
-// or `detached`. The session's own worktree and stale (prunable) ones are left out.
+// or `detached` (named by its folder). The session's own worktree and stale (prunable) ones are left out.
 async function refreshWorktrees($: EngineInterface) {
   const run = ++worktreesRun
   const cwd = await $.session.cwd()
@@ -315,8 +315,11 @@ async function refreshWorktrees($: EngineInterface) {
       const real = await realPath($, path)
       if (here !== null && real !== null ? real === here : path === topPath) continue
       const ref = lines.find(l => l.startsWith('branch '))?.slice(7)
+      // A detached worktree has no branch to go by, so its folder names it (a throwaway checkout's
+      // folder says what it is for); the commit only when the folder can't be named.
       const head = lines.find(l => l.startsWith('HEAD '))?.slice(5, 12)
-      const name = ref ? ref.replace(/^refs\/heads\//, '') : head ? `@${head}` : path.split('/').pop() ?? path
+      const folder = path.split(/[\\/]/).filter(Boolean).pop()
+      const name = ref ? ref.replace(/^refs\/heads\//, '') : folder ?? (head ? `@${head}` : path)
       found.push({ path, name, agent: /\/\.claude\/worktrees\/agent-[^/]+$/.test(path) || AGENT_BRANCH.test(name) })
     }
   }

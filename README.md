@@ -19,7 +19,7 @@ Usage and Status Banner Plugin for Claude
   - `cache`: the prompt-cache countdown, yellow in the last five minutes and red in the last minute
 - **Row 2: status**, left to right
   - Left: the git branch, green on the main branch and yellow on any other
-  - Middle: `wt`, the repository's other worktrees, each by its branch (`@<hash>` when detached), cut to 24
+  - Middle: `wt`, the repository's other worktrees, each by its branch (by its folder when detached), cut to 24
     characters, or a dimmed `none`. The worktree this session is in is left out, as its branch is on the
     left. Outside a git repository `wt` is not shown
   - Middle: `bg`, the background tasks, each with how long it has run, or a dimmed `none`
