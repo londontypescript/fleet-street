@@ -122,16 +122,17 @@ const truncate = (text: string, max: number) =>
   max <= 0 ? '' : text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…`
 
 // One entry in the middle of row 2: a worktree, a task, or a count standing for several.
-type MidItem = { key: string; text: string; color: string; note?: string }
+// count: how many worktrees the entry stands for, so `+N` counts the worktrees it hides.
+type MidItem = { key: string; text: string; color: string; note?: string; count?: number }
 
-// `wt a │ b │ bg none`: each label and entry, a column between the parts and three around each │. An empty
+// `wt a │ b │ bg none`: each label and entry with the column before it, and each │ with the one after it. An empty
 // section reads `none`; a hidden one (null) takes no room.
 const sectionWidth = (label: string, items: MidItem[] | null) =>
   items === null
     ? 0
     : items.length === 0
       ? label.length + 5
-      : label.length + items.reduce((w, x) => w + 1 + x.text.length + (x.note ? x.note.length + 1 : 0), 0) + 3 * (items.length - 1)
+      : label.length + items.reduce((w, x) => w + 1 + x.text.length + (x.note ? x.note.length + 1 : 0), 0) + 2 * (items.length - 1)
 const middleWidth = (wt: MidItem[] | null, bg: MidItem[]) => {
   const a = sectionWidth('wt', wt)
   return a + sectionWidth('bg', bg) + (a > 0 ? 3 : 0)
@@ -161,12 +162,13 @@ type SessionRecord = {
   archived: boolean
 }
 const records = new Map<string, { mtimeMs: number; record: SessionRecord | null }>()
-const realPaths = new Map<string, string | null>()
+const realPaths = new Map<string, string>()
 
+// A path with its symlinks resolved; null when it can't be, and then asked again next time.
 const realPath = async ($: EngineInterface, path: string) => {
   if (!realPaths.has(path)) {
     const stat = await $.fs.stat(path, { resolve: true }).catch(() => undefined)
-    realPaths.set(path, stat?.realPath ?? null)
+    if (stat?.realPath) realPaths.set(path, stat.realPath)
   }
   return realPaths.get(path) ?? null
 }
@@ -288,28 +290,37 @@ async function refreshBranch($: EngineInterface) {
 }
 
 let worktreesShown = ''
+// Each refresh takes the next number; one that finishes after a later one started drops its result.
+let worktreesRun = 0
 
 // `git worktree list --porcelain`: one block per worktree, `worktree <path>` then `branch refs/heads/<name>`
 // or `detached`. The session's own worktree and stale (prunable) ones are left out.
 async function refreshWorktrees($: EngineInterface) {
+  const run = ++worktreesRun
   const cwd = await $.session.cwd()
   const git = (...args: string[]) => $.process.run(['git', ...args], { cwd, timeoutMs: 5000 })
   const top = await git('rev-parse', '--show-toplevel').catch(() => null)
   const listed = top && top.exitCode === 0 ? await git('worktree', 'list', '--porcelain').catch(() => null) : null
   const found: Worktree[] = []
   if (top && listed && listed.exitCode === 0) {
-    const here = await realPath($, top.stdout.trim())
-    for (const block of listed.stdout.split(/\n\s*\n/)) {
-      const lines = block.split('\n').map(l => l.trim())
+    // Only git's closing newline is cut: like the worktree paths below, this one may end in a space.
+    const topPath = top.stdout.replace(/\r?\n$/, '')
+    const here = await realPath($, topPath)
+    // Lines are split but not trimmed: a path may end in a space.
+    for (const block of listed.stdout.split(/\r?\n\r?\n/)) {
+      const lines = block.split(/\r?\n/)
       const path = lines.find(l => l.startsWith('worktree '))?.slice(9)
       if (!path || lines.some(l => l === 'bare' || l.startsWith('prunable'))) continue
-      if ((await realPath($, path)) === here) continue
+      // Only two paths that both resolve can be the same; failing that, the paths as git gives them.
+      const real = await realPath($, path)
+      if (here !== null && real !== null ? real === here : path === topPath) continue
       const ref = lines.find(l => l.startsWith('branch '))?.slice(7)
       const head = lines.find(l => l.startsWith('HEAD '))?.slice(5, 12)
       const name = ref ? ref.replace(/^refs\/heads\//, '') : head ? `@${head}` : path.split('/').pop() ?? path
       found.push({ path, name, agent: /\/\.claude\/worktrees\/agent-[^/]+$/.test(path) || AGENT_BRANCH.test(name) })
     }
   }
+  if (run !== worktreesRun) return
   const key = found.map(w => `${w.path}|${w.name}`).join()
   if (key !== worktreesShown) {
     worktreesShown = key
@@ -619,7 +630,7 @@ export const register: Register = (on, options) => {
         color: w.name === mainBranch ? 'green' : 'cyan',
       })
       return group && byAgents.length > 1
-        ? [...own.map(named), { key: 'agents', text: `agent ×${byAgents.length}`, color: 'cyan' }]
+        ? [...own.map(named), { key: 'agents', text: `agent ×${byAgents.length}`, color: 'cyan', count: byAgents.length }]
         : [...own, ...byAgents].map(named)
     }
     const bgFull: MidItem[] = bg.map(b => ({ key: b.id, text: b.label, color: 'magenta', note: age(b.startedAt) }))
@@ -634,13 +645,14 @@ export const register: Register = (on, options) => {
       [tight, bgCount],
     ]
     for (let k = tight.length - 1; k >= 1; k--) {
-      layouts.push([[...tight.slice(0, k), { key: 'more', text: `+${tight.length - k}`, color: 'cyan' }], bgCount])
+      const hidden = tight.slice(k).reduce((n, x) => n + (x.count ?? 1), 0)
+      layouts.push([[...tight.slice(0, k), { key: 'more', text: `+${hidden}`, color: 'cyan' }], bgCount])
     }
     if (trees.length > 0) layouts.push([[{ key: 'count', text: `×${trees.length}`, color: 'cyan' }], bgCount])
     // Outside a git repository there are no worktrees to speak of, so `wt` is left out rather than shown as none.
     const inRepo = onBranch !== null
-    const [wtShown, bgShown] =
-      layouts.find(([w, b]) => middleWidth(inRepo ? w : null, b) * scale <= room) ?? layouts[layouts.length - 1] ?? [[], []]
+    // When not even a count fits, the middle is left empty rather than pushing the line past the edge.
+    const fitting = layouts.find(([w, b]) => middleWidth(inRepo ? w : null, b) * scale <= room)
 
     const section = (label: string, items: MidItem[]) => (
       <Box flexWrap="nowrap" columnGap={1}>
@@ -670,7 +682,11 @@ export const register: Register = (on, options) => {
 
     // Branch on the left, worktrees and background tasks in the middle (each `none` when empty), session
     // time on the right.
-    const middleParts = inRepo ? [section('wt', wtShown), section('bg', bgShown)] : [section('bg', bgShown)]
+    const middleParts = !fitting
+      ? []
+      : inRepo
+        ? [section('wt', fitting[0]), section('bg', fitting[1])]
+        : [section('bg', fitting[1])]
     const statusLine =
       branchPart || timePart || middleParts.length > 0 ? (
         <Box width="100%" flexWrap="nowrap" columnGap={1}>
