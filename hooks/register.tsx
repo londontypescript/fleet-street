@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
-import type { Away, BgTask, Context, Limit, RecentSession, Subagent } from '../types'
+import type { Away, BgTask, Context, Limit, RecentSession, Worktree } from '../types'
 
 const limits = atom({ plugin: 'fleet-street', key: 'limits' } as const, [] as Limit[])
 const context = atom({ plugin: 'fleet-street', key: 'context' } as const, null as Context | null)
@@ -9,13 +9,14 @@ const lastResponseAt = atom({ plugin: 'fleet-street', key: 'lastResponseAt' } as
 const now = atom({ plugin: 'fleet-street', key: 'now' } as const, 0)
 const timerStart = atom({ plugin: 'fleet-street', key: 'timerStart' } as const, null as number | null)
 const away = atom({ plugin: 'fleet-street', key: 'away' } as const, null as Away | null)
-const subagents = atom({ plugin: 'fleet-street', key: 'subagents' } as const, [] as Subagent[])
-// Background shells and monitors (background subagents are on the agents list already).
+// The repository's other worktrees (not the one this session is in), in git's order.
+const worktrees = atom({ plugin: 'fleet-street', key: 'worktrees' } as const, [] as Worktree[])
+// Background shells and monitors (background subagents are left out).
 const bgTasks = atom({ plugin: 'fleet-street', key: 'bgTasks' } as const, [] as BgTask[])
 // The session folder's branch, `@<hash>` on a detached HEAD, null outside a git repository.
 const branch = atom({ plugin: 'fleet-street', key: 'branch' } as const, null as string | null)
 
-// The three most recently updated other sessions of this project, newest first; null until a scan
+// The three most recently updated other sessions, across every project, newest first; null until a scan
 // finds the desktop app's session records (never, on a machine without the desktop app).
 const recent = atom({ plugin: 'fleet-street', key: 'recent' } as const, null as RecentSession[] | null)
 // This session's choice from /toggle-sessions; null follows the showSessions option.
@@ -28,12 +29,6 @@ const activeKey = async ($: EngineInterface) => `active:${await $.session.id()}`
 
 // Prompts that mean the person is at the keyboard (typed here or through Remote Control).
 const PERSON_ORIGINS = new Set(['composer', 'bridge'])
-
-// claude-sonnet-5-5 → sonnet 5.5, claude-haiku-4-5-20251001 → haiku 4.5; an alias stays as it is.
-const fmtModel = (id: string) => {
-  const m = /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?/.exec(id)
-  return m ? `${m[1]} ${m[2]}${m[3] ? `.${m[3]}` : ''}` : id
-}
 
 
 // Subscriptions (which report rate limits) get the 1-hour prompt cache; API keys the 5-minute one.
@@ -72,26 +67,6 @@ const fmtElapsed = (ms: number) => {
   return h > 0 ? `${h}h${String(m % 60).padStart(2, '0')}m` : `${m}m`
 }
 
-const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
-const MONTHS = [
-  'January', 'February', 'March', 'April', 'May', 'June',
-  'July', 'August', 'September', 'October', 'November', 'December',
-]
-
-// 1st, 2nd, 3rd, 4th … 11th, 12th, 13th, 21st.
-const ordinal = (n: number) => {
-  const r = n % 100
-  if (r >= 11 && r <= 13) return `${n}th`
-  return `${n}${['th', 'st', 'nd', 'rd'][n % 10] ?? 'th'}`
-}
-
-// Sunday 4th October 02:35, in local time.
-const fmtClock = (ms: number) => {
-  const d = new Date(ms)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${WEEKDAYS[d.getDay()]} ${ordinal(d.getDate())} ${MONTHS[d.getMonth()]} ${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
-
 const levelColor = (pct: number) => (pct >= 90 ? 'red' : pct >= 70 ? 'yellow' : 'green')
 
 // Both halves use the same full block so they line up; the empty part is just drawn grey.
@@ -106,9 +81,8 @@ const FINAL_COUNTDOWN_MS = 5 * 60 * 1000
 const fmtCacheLeft = (ms: number) =>
   ms <= FINAL_COUNTDOWN_MS ? fmtDuration(ms) : `${Math.min(60, Math.ceil(ms / 60_000))}m`
 
-// Module mirrors: the away check and the subagent bookkeeping read them without a state round trip.
+// Module mirrors: the away check and the task bookkeeping read them without a state round trip.
 let lastActive: number | null = null
-let subagentCount = 0
 
 let bgCount = 0
 
@@ -147,6 +121,32 @@ const fmtAgo = (ms: number) => {
 const truncate = (text: string, max: number) =>
   max <= 0 ? '' : text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…`
 
+// One entry in the middle of row 2: a worktree, a task, or a count standing for several.
+type MidItem = { key: string; text: string; color: string; note?: string }
+
+// `wt a │ b │ bg none`: each label and entry, a column between the parts and three around each │. An empty
+// section reads `none`; a hidden one (null) takes no room.
+const sectionWidth = (label: string, items: MidItem[] | null) =>
+  items === null
+    ? 0
+    : items.length === 0
+      ? label.length + 5
+      : label.length + items.reduce((w, x) => w + 1 + x.text.length + (x.note ? x.note.length + 1 : 0), 0) + 3 * (items.length - 1)
+const middleWidth = (wt: MidItem[] | null, bg: MidItem[]) => {
+  const a = sectionWidth('wt', wt)
+  return a + sectionWidth('bg', bg) + (a > 0 ? 3 : 0)
+}
+
+// A desktop draws proportional text, which takes about this share of the cells its length suggests.
+const DESKTOP_TEXT_SCALE = 0.85
+
+// The app names a subagent's worktree branch worktree-agent-<id>; the first seven of the id tell them apart.
+const AGENT_BRANCH = /^worktree-agent-([0-9a-f]{7})[0-9a-f]*$/
+const agentName = (name: string) => {
+  const m = AGENT_BRANCH.exec(name)
+  return m ? `agent-${m[1]}` : name
+}
+
 // Each recent session's cell takes the same share of the row; the gaps between them take the rest.
 const CELL_PERCENT = 32
 // A cell's frame: a rounded border and a column of padding on each side.
@@ -158,7 +158,6 @@ type SessionRecord = {
   cliId?: string
   title: string
   updatedAt: number
-  dirs: string[]
   archived: boolean
 }
 const records = new Map<string, { mtimeMs: number; record: SessionRecord | null }>()
@@ -182,7 +181,6 @@ const parseRecord = (text: string): SessionRecord | null => {
       cliId: typeof s.cliSessionId === 'string' ? s.cliSessionId : undefined,
       title: String(s.title || 'Untitled').split(/\s+/).filter(Boolean).join(' '),
       updatedAt: Number(at),
-      dirs: [s.originCwd, s.cwd].filter((d): d is string => typeof d === 'string' && d !== ''),
       archived: Boolean(s.isArchived),
     }
   } catch {
@@ -213,12 +211,8 @@ async function findSessionsRoot($: EngineInterface): Promise<SessionsRoot | null
 
 let sessionsRoot: SessionsRoot | null | undefined
 
-// Windows paths compare without regard to case or slash direction.
-const samePath = (os: DesktopOs, a: string, b: string) =>
-  os === 'windows' ? a.replace(/\\/g, '/').toLowerCase() === b.replace(/\\/g, '/').toLowerCase() : a === b
-
-// The desktop app's own session records (<root>/<account>/<org>/local_*.json), scanned for this
-// folder's latest unarchived sessions other than this one. Only files changed since the last scan
+// The desktop app's own session records (<root>/<account>/<org>/local_*.json), scanned for the latest
+// unarchived sessions other than this one, whatever their folder. Only files changed since the last scan
 // are read again. With no desktop app the list is null and the row is not drawn.
 async function refreshRecent($: EngineInterface) {
   if (sessionsRoot === undefined || sessionsRoot === null) sessionsRoot = await findSessionsRoot($)
@@ -226,8 +220,7 @@ async function refreshRecent($: EngineInterface) {
     if ((await read($, recent)) !== null) await update($, recent, () => null)
     return
   }
-  const { os, path: root } = sessionsRoot
-  const folder = await realPath($, await $.session.root())
+  const { path: root } = sessionsRoot
   const current = await $.session.id()
   const dirsOf = async (path: string) =>
     (await $.fs.list(path).catch(() => [])).filter(d => d.kind === 'dir').map(d => `${path}/${d.name}`)
@@ -248,12 +241,7 @@ async function refreshRecent($: EngineInterface) {
         }
         const r = cached.record
         if (!r || r.archived || (r.cliId !== undefined && r.cliId === current)) continue
-        let here = false
-        for (const d of r.dirs) {
-          const real = await realPath($, d)
-          if (real !== null && folder !== null && samePath(os, real, folder)) here = true
-        }
-        if (here) found.push({ id: r.id, title: r.title, updatedAt: r.updatedAt, link: `claude://claude.ai/epitaxy/${r.id}` })
+        found.push({ id: r.id, title: r.title, updatedAt: r.updatedAt, link: `claude://claude.ai/epitaxy/${r.id}` })
       }
     }
   }
@@ -299,6 +287,36 @@ async function refreshBranch($: EngineInterface) {
   }
 }
 
+let worktreesShown = ''
+
+// `git worktree list --porcelain`: one block per worktree, `worktree <path>` then `branch refs/heads/<name>`
+// or `detached`. The session's own worktree and stale (prunable) ones are left out.
+async function refreshWorktrees($: EngineInterface) {
+  const cwd = await $.session.cwd()
+  const git = (...args: string[]) => $.process.run(['git', ...args], { cwd, timeoutMs: 5000 })
+  const top = await git('rev-parse', '--show-toplevel').catch(() => null)
+  const listed = top && top.exitCode === 0 ? await git('worktree', 'list', '--porcelain').catch(() => null) : null
+  const found: Worktree[] = []
+  if (top && listed && listed.exitCode === 0) {
+    const here = await realPath($, top.stdout.trim())
+    for (const block of listed.stdout.split(/\n\s*\n/)) {
+      const lines = block.split('\n').map(l => l.trim())
+      const path = lines.find(l => l.startsWith('worktree '))?.slice(9)
+      if (!path || lines.some(l => l === 'bare' || l.startsWith('prunable'))) continue
+      if ((await realPath($, path)) === here) continue
+      const ref = lines.find(l => l.startsWith('branch '))?.slice(7)
+      const head = lines.find(l => l.startsWith('HEAD '))?.slice(5, 12)
+      const name = ref ? ref.replace(/^refs\/heads\//, '') : head ? `@${head}` : path.split('/').pop() ?? path
+      found.push({ path, name, agent: /\/\.claude\/worktrees\/agent-[^/]+$/.test(path) || AGENT_BRANCH.test(name) })
+    }
+  }
+  const key = found.map(w => `${w.path}|${w.name}`).join()
+  if (key !== worktreesShown) {
+    worktreesShown = key
+    await update($, worktrees, () => found)
+  }
+}
+
 async function setTimer($: EngineInterface, start: number) {
   await $.store.set(await timerKey($), start)
   await update($, timerStart, () => start)
@@ -309,19 +327,6 @@ async function setTimer($: EngineInterface, start: number) {
 async function markActive($: EngineInterface, t: number) {
   lastActive = t
   await $.store.set(await activeKey($), t)
-}
-
-async function setSubagents($: EngineInterface, fn: (list: Subagent[]) => Subagent[]) {
-  await update($, subagents, list => {
-    const next = fn(list)
-    subagentCount = next.length
-    return next
-  })
-}
-
-async function pruneSubagents($: EngineInterface) {
-  const running = new Set((await $.agent.list()).filter(a => a.status === 'running').map(a => a.id))
-  await setSubagents($, list => (list.every(a => running.has(a.id)) ? list : list.filter(a => running.has(a.id))))
 }
 
 export const register: Register = (on, options) => {
@@ -348,7 +353,6 @@ export const register: Register = (on, options) => {
     await update($, timerStart, () => start)
     const active = await $.store.get(await activeKey($))
     lastActive = typeof active === 'number' ? active : null
-    subagentCount = (await read($, subagents)).length
     bgCount = (await read($, bgTasks)).length
     await $.command.register({ name: 'reset-timer', description: 'Restart the session timer in the fleet-street banner' })
     await $.command.register({
@@ -356,14 +360,16 @@ export const register: Register = (on, options) => {
       description: 'Hide or show the recent-sessions row in the fleet-street banner for this session',
     })
     void refreshBranch($)
+    void refreshWorktrees($)
     void refreshRecent($).catch(err => $.ui.log(`fleet-street: recent sessions failed: ${err}`))
     $.clock.every(1000, () => {
       const t = Date.now()
       // A checkout made outside the session (another terminal) shows within five seconds.
-      if (Math.floor(t / 1000) % 5 === 0) void refreshBranch($)
+      if (Math.floor(t / 1000) % 5 === 0) {
+        void refreshBranch($)
+        void refreshWorktrees($)
+      }
       if (Math.floor(t / 1000) % 15 === 0) void refreshRecent($).catch(() => {})
-      // A subagent that was stopped may never report its end; drop any the engine no longer runs.
-      if (subagentCount > 0 && Math.floor(t / 1000) % 10 === 0) void pruneSubagents($)
       const left = lastAt === null ? Infinity : lastAt + ttl - t
       const key = left > 0 && left <= FINAL_COUNTDOWN_MS ? `s${Math.floor(t / 1000)}` : `m${Math.floor(t / 60_000)}:${left > 0}`
       if (key !== drawnKey) {
@@ -456,22 +462,6 @@ export const register: Register = (on, options) => {
     return result
   })
 
-  on('agent.spawn', async ($, e, next) => {
-    const result = await next(e)
-    if ('agentId' in result && result.agentId) {
-      const agent: Subagent = {
-        id: result.agentId,
-        type: e.subagentType,
-        description: e.description,
-        model: result.model,
-        tokens: 0,
-        startedAt: Date.now(),
-      }
-      await setSubagents($, list => [...list.filter(a => a.id !== agent.id), agent])
-    }
-    return result
-  })
-
   on('session.measure', async ($, e, next) => {
     ttl = e.rateLimits.length > 0 ? TTL_SUBSCRIPTION_MS : TTL_API_MS
     await update($, limits, () => e.rateLimits)
@@ -481,16 +471,6 @@ export const register: Register = (on, options) => {
 
   on('turn.step', async function* ($, e, next) {
     const result = yield* next(e)
-    const usage = result.usage
-    if (e.agentId !== undefined && usage) {
-      // What the subagent's conversation holds after this step: the same measure as ctx.
-      const tokens =
-        usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens + usage.output_tokens
-      const id = e.agentId
-      if (subagentCount > 0) {
-        await setSubagents($, list => list.map(a => (a.id === id ? { ...a, tokens, model: usage.model } : a)))
-      }
-    }
     if (e.agentId === undefined) {
       const at = Date.now()
       lastAt = at
@@ -508,9 +488,7 @@ export const register: Register = (on, options) => {
       await update($, now, () => at)
       await markActive($, at)
       await refreshBranch($)
-    } else if (subagentCount > 0) {
-      const id = e.agentId
-      await setSubagents($, list => list.filter(a => a.id !== id))
+      await refreshWorktrees($)
     }
     return next(e)
   })
@@ -527,7 +505,7 @@ export const register: Register = (on, options) => {
     const last = await read($, lastResponseAt)
     const started = await read($, timerStart)
     const gap = await read($, away)
-    const agents = await read($, subagents)
+    const trees = await read($, worktrees)
     const onBranch = await read($, branch)
     const bg = await read($, bgTasks)
     const sessions = await read($, recent)
@@ -614,37 +592,14 @@ export const register: Register = (on, options) => {
         </Box>
       ) : null
 
-    // One entry per subagent (model and tokens); when that would overflow the line, one per model with a count.
-    const perAgent = agents.map(a => ({
-      key: a.id,
-      model: fmtModel(a.model),
-      count: 1,
-      tokens: a.tokens,
-      startedAt: a.startedAt ?? t,
-    }))
     // Under a minute reads <1m, so the banner keeps its once-a-minute redraw.
     const age = (startedAt: number) => (t - startedAt < 60_000 ? '<1m' : fmtElapsed(t - startedAt))
-    const widthOf = (list: typeof perAgent) =>
-      7 + list.reduce((w, x) => w + x.model.length + fmtTokens(x.tokens).length + age(x.startedAt).length + (x.count > 1 ? 4 : 0) + 5, 0)
-    let entries = perAgent
-    const bgWidth = bg.length === 0 ? 0 : 5 + bg.reduce((w, b) => w + b.label.length + age(b.startedAt).length + 4, 0)
     // The second line's outer columns share one width, so the middle one sits at the true centre.
     const elapsed = started !== null ? fmtElapsed(t - started) : null
     const sideWidth = Math.max(onBranch ? onBranch.length + 3 : 0, elapsed ? elapsed.length + 5 : 0)
-    const fixedWidth = 2 * sideWidth + bgWidth + 2
-    if (widthOf(perAgent) + fixedWidth > e.props.bodyColumns) {
-      const byModel = new Map<string, (typeof perAgent)[number]>()
-      for (const x of perAgent) {
-        const g = byModel.get(x.model)
-        byModel.set(
-          x.model,
-          g
-            ? { ...g, count: g.count + 1, tokens: g.tokens + x.tokens, startedAt: Math.min(g.startedAt, x.startedAt) }
-            : { ...x, key: x.model },
-        )
-      }
-      entries = [...byModel.values()]
-    }
+    // The middle's room in character cells; a desktop's proportional text takes fewer than its length.
+    const room = e.props.bodyColumns - 2 * sideWidth - 2
+    const scale = e.surface === 'terminal' ? 1 : DESKTOP_TEXT_SCALE
 
     const branchPart = onBranch ? (
       <Text color={onBranch === mainBranch ? 'green' : 'yellow'} bold={onBranch !== mainBranch}>
@@ -652,50 +607,59 @@ export const register: Register = (on, options) => {
       </Text>
     ) : null
 
-    const agentPart =
-      entries.length > 0 ? (
-        <Box flexWrap="nowrap" columnGap={1}>
-          <Text bold>agents</Text>
-          {entries.flatMap((x, i) => {
+    // Worktrees and background tasks, squeezed one step at a time until they fit on the line: the full list;
+    // subagent worktrees by their hash; tasks as a count; subagent worktrees as a count; names cut to 12;
+    // the first names and a count of the rest; and last a count alone.
+    const own = trees.filter(w => !w.agent)
+    const byAgents = trees.filter(w => w.agent)
+    const wtItems = (shorten: boolean, group: boolean, max: number): MidItem[] => {
+      const named = (w: Worktree): MidItem => ({
+        key: w.path,
+        text: truncate(shorten && w.agent ? agentName(w.name) : w.name, max),
+        color: w.name === mainBranch ? 'green' : 'cyan',
+      })
+      return group && byAgents.length > 1
+        ? [...own.map(named), { key: 'agents', text: `agent ×${byAgents.length}`, color: 'cyan' }]
+        : [...own, ...byAgents].map(named)
+    }
+    const bgFull: MidItem[] = bg.map(b => ({ key: b.id, text: b.label, color: 'magenta', note: age(b.startedAt) }))
+    const bgCount: MidItem[] =
+      bg.length === 0 ? [] : [{ key: 'bg', text: `×${bg.length}`, color: 'magenta', note: age(Math.min(...bg.map(b => b.startedAt))) }]
+    const tight = wtItems(true, true, 12)
+    const layouts: [MidItem[], MidItem[]][] = [
+      [wtItems(false, false, 24), bgFull],
+      [wtItems(true, false, 24), bgFull],
+      [wtItems(true, false, 24), bgCount],
+      [wtItems(true, true, 24), bgCount],
+      [tight, bgCount],
+    ]
+    for (let k = tight.length - 1; k >= 1; k--) {
+      layouts.push([[...tight.slice(0, k), { key: 'more', text: `+${tight.length - k}`, color: 'cyan' }], bgCount])
+    }
+    if (trees.length > 0) layouts.push([[{ key: 'count', text: `×${trees.length}`, color: 'cyan' }], bgCount])
+    // Outside a git repository there are no worktrees to speak of, so `wt` is left out rather than shown as none.
+    const inRepo = onBranch !== null
+    const [wtShown, bgShown] =
+      layouts.find(([w, b]) => middleWidth(inRepo ? w : null, b) * scale <= room) ?? layouts[layouts.length - 1] ?? [[], []]
+
+    const section = (label: string, items: MidItem[]) => (
+      <Box flexWrap="nowrap" columnGap={1}>
+        <Text bold>{label}</Text>
+        {items.length === 0 ? (
+          <Text dimColor>none</Text>
+        ) : (
+          items.flatMap((x, i) => {
             const row = (
               <Box key={x.key} columnGap={1}>
-                <Text color="cyan">
-                  {x.model}
-                  {x.count > 1 ? ` ×${x.count}` : ''}
-                </Text>
-                <Text>{x.tokens > 0 ? fmtTokens(x.tokens) : '…'}</Text>
-                <Text dimColor>{age(x.startedAt)}</Text>
+                <Text color={x.color}>{x.text}</Text>
+                {x.note ? <Text dimColor>{x.note}</Text> : null}
               </Box>
             )
             return i === 0 ? [row] : [sep, row]
-          })}
-        </Box>
-      ) : null
-
-    // Each task by its command; collapsed to a count and the oldest's age when the line has no room.
-    const bgCollapsed = 2 * sideWidth + 2 + widthOf(entries) + bgWidth > e.props.bodyColumns
-    const bgPart =
-      bg.length === 0 ? null : (
-        <Box flexWrap="nowrap" columnGap={1}>
-          <Text bold>bg</Text>
-          {bgCollapsed ? (
-            <Box columnGap={1}>
-              <Text color="magenta">×{bg.length}</Text>
-              <Text dimColor>{age(Math.min(...bg.map(b => b.startedAt)))}</Text>
-            </Box>
-          ) : (
-            bg.flatMap((b, i) => {
-              const row = (
-                <Box key={b.id} columnGap={1}>
-                  <Text color="magenta">{b.label}</Text>
-                  <Text dimColor>{age(b.startedAt)}</Text>
-                </Box>
-              )
-              return i === 0 ? [row] : [sep, row]
-            })
-          )}
-        </Box>
-      )
+          })
+        )}
+      </Box>
+    )
 
     const timePart = elapsed ? (
       <Box columnGap={1}>
@@ -704,22 +668,17 @@ export const register: Register = (on, options) => {
       </Box>
     ) : null
 
-    // Branch on the left, agents and background tasks in the middle, session time on the right.
-    const middleParts = [agentPart, bgPart].filter(p => p !== null)
-    // With no agents or background tasks the middle shows the date and time, if it fits between the sides.
-    const clockText = middleParts.length === 0 && t > 0 ? fmtClock(t) : null
-    const clockPart =
-      clockText !== null && 2 * sideWidth + 2 + clockText.length <= e.props.bodyColumns ? (
-        <Text dimColor>{clockText}</Text>
-      ) : null
-    if (clockPart) middleParts.push(clockPart)
-    const agentLine =
+    // Branch on the left, worktrees and background tasks in the middle (each `none` when empty), session
+    // time on the right.
+    const middleParts = inRepo ? [section('wt', wtShown), section('bg', bgShown)] : [section('bg', bgShown)]
+    const statusLine =
       branchPart || timePart || middleParts.length > 0 ? (
         <Box width="100%" flexWrap="nowrap" columnGap={1}>
           <Box width={sideWidth} flexShrink={0}>
             {branchPart}
           </Box>
-          <Box flexGrow={1} justifyContent="center" columnGap={1}>
+          {/* Spread evenly: the gaps take the spare room and shrink to one column as the lists grow. */}
+          <Box flexGrow={1} justifyContent="space-evenly" columnGap={1}>
             {middleParts.flatMap((p, i) => (i === 0 ? [p] : [sep, p]))}
           </Box>
           <Box width={sideWidth} flexShrink={0} justifyContent="flex-end">
@@ -763,7 +722,7 @@ export const register: Register = (on, options) => {
         </Box>
       ) : null
 
-    if (!awayLine && !agentLine && !recentLine) {
+    if (!awayLine && !statusLine && !recentLine) {
       return firstLine
     }
 
@@ -771,7 +730,7 @@ export const register: Register = (on, options) => {
       <Box width="100%" flexDirection="column" rowGap={1}>
         {firstLine}
         {awayLine}
-        {agentLine}
+        {statusLine}
         {recentLine}
       </Box>
     )

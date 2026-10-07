@@ -2,14 +2,13 @@
 
 Usage and Status Banner Plugin for Claude
 
-**With subagents or background tasks running:** the middle of row 2 lists them.
+**With the recent-sessions row:** the banner with another worktree and a background task running.
 
-![The banner with a subagent and a background task running](docs/banner-busy.png)
+![The banner with a worktree, a background task and the recent-sessions row](docs/banner.png)
 
-**With no subagents or background tasks running:** the middle of row 2 shows the date and time instead, so
-the row never looks empty.
+**Without it:** `/toggle-sessions` hides or shows the row for the session.
 
-![The banner with nothing running, showing the date and time](docs/banner-idle.png)
+![The banner with the recent-sessions row hidden](docs/banner-no-sessions.png)
 
 ## What it shows
 
@@ -20,11 +19,16 @@ the row never looks empty.
   - `cache`: the prompt-cache countdown, yellow in the last five minutes and red in the last minute
 - **Row 2: status**, left to right
   - Left: the git branch, green on the main branch and yellow on any other
-  - Middle, while subagents are running: `agents`, each with its model, tokens used and how long it has run
-  - Middle, while background tasks are running: `bg`, each with how long it has run
-  - Middle, when neither is running: the date and time
+  - Middle: `wt`, the repository's other worktrees, each by its branch (`@<hash>` when detached), or a dimmed
+    `none`. The worktree this session is in is left out, as its branch is on the left. Outside a git
+    repository `wt` is not shown
+  - Middle: `bg`, the background tasks, each with how long it has run, or a dimmed `none`
+  - When the middle runs out of room it is squeezed one step at a time, stopping at the first that fits:
+    subagent worktrees shortened to `agent-<hash>`, then background tasks shown as a count, then subagent
+    worktrees grouped as `agent ×N`, then names cut to 12 characters, then the first names and `+N` for the
+    rest, and last `×N` alone
   - Right: `time`, how long the session has been running
-- **Row 3: recent sessions**: this project's three most recently active other sessions in the desktop app,
+- **Row 3: recent sessions**: the three most recently active other sessions in the desktop app, from any project,
   each in its own box with its title and how long ago it was last active. Clicking a title opens that session.
   `/toggle-sessions` hides or shows the row. The sessions are read from the desktop app's data folder
   (`%APPDATA%\Claude` on Windows, `~/Library/Application Support/Claude` on macOS, `~/.config/Claude` on
@@ -58,7 +62,7 @@ Set in the plugin's config:
 | --- | --- | --- |
 | `awayMinutes` | `30` | Minutes without activity before the banner asks whether to keep the session timer going |
 | `mainBranch` | `main` | The branch shown in green; any other branch is shown in yellow |
-| `showSessions` | `true` | Show the row of this project's recent sessions |
+| `showSessions` | `true` | Show the row of recent sessions |
 
 ## Commands
 
@@ -77,5 +81,6 @@ claude plugin validate .
 `tsconfig.json` extends `.claude-plugin/types/tsconfig.json`, which is generated and not committed. Run
 `/plugin-types` in Claude Code to write it before type-checking in an editor.
 
-The banner is drawn on terminal and desktop surfaces. The desktop surface uses proportional text, so don't
-size anything from the column count; keep decorations to fixed, single-character pieces.
+The banner is drawn on terminal and desktop surfaces. The desktop surface uses proportional text, so a line's
+character count only estimates its width there (row 2 counts it at 85%); keep decorations to fixed,
+single-character pieces.
