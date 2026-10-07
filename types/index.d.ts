@@ -2,7 +2,8 @@ export type Limit = { kind: string; percentUsed: number; resetsAt?: string }
 export type Context = { tokens?: number; window: number; percent?: number }
 export type Away = { gapMs: number }
 export type BgTask = { id: string; label: string; startedAt: number }
-export type Subagent = { id: string; type: string; description: string; model: string; tokens: number; startedAt?: number }
+// agent: a worktree the app made for a subagent (.claude/worktrees/agent-…, branch worktree-agent-…).
+export type Worktree = { path: string; name: string; agent: boolean }
 
 export type RecentSession = { id: string; title: string; updatedAt: number; link: string }
 
@@ -15,7 +16,7 @@ declare module 'claude-code' {
       now: number
       timerStart: number | null
       away: Away | null
-      subagents: Subagent[]
+      worktrees: Worktree[]
       branch: string | null
       bgTasks: BgTask[]
       recent: RecentSession[] | null
