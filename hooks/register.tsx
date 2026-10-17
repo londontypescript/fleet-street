@@ -691,14 +691,28 @@ const CHECK_MARKS: Record<Checks['state'], { mark: string; color: string | undef
 }
 
 // statusCheckRollup mixes check runs (`status`, then `conclusion` once COMPLETED) with legacy status
-// contexts (`state`). A failure wins over running checks; a value not known here makes the result unknown.
-const summariseChecks = (rollup: unknown): Checks | null => {
-  if (!Array.isArray(rollup) || rollup.length === 0) return null
+// contexts (`state`), and keeps every run: a re-run's superseded (often cancelled) run stays beside it. As on
+// GitHub's own page, only the latest run of each check counts: by workflow and name, or a status's context.
+// A failure wins over running checks; a value not known here makes the result unknown.
+const latestChecks = (rollup: Record<string, unknown>[]) => {
+  const latest = new Map<string, Record<string, unknown>>()
+  for (const c of rollup) {
+    const key = `${String(c.workflowName ?? '')}\0${String(c.name ?? c.context ?? '')}`
+    const kept = latest.get(key)
+    // ISO times compare as strings; one without a time counts as later, as the rollup lists runs in order.
+    if (!kept || String(c.startedAt ?? '\uffff') >= String(kept.startedAt ?? '')) latest.set(key, c)
+  }
+  return [...latest.values()]
+}
+
+const summariseChecks = (raw: unknown): Checks | null => {
+  if (!Array.isArray(raw) || raw.length === 0) return null
+  const rollup = latestChecks(raw as Record<string, unknown>[])
   let passed = 0
   let failed = 0
   let running = 0
   let unknown = 0
-  for (const c of rollup as Record<string, unknown>[]) {
+  for (const c of rollup) {
     const legacy = c.__typename === 'StatusContext' || (c.status === undefined && typeof c.state === 'string')
     const done = legacy ? c.state !== 'PENDING' && c.state !== 'EXPECTED' : c.status === 'COMPLETED'
     const result = String((legacy ? c.state : c.conclusion) ?? '')
