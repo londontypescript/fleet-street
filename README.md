@@ -28,11 +28,27 @@ Usage and Status Banner Plugin for Claude
     worktrees grouped as `agent ×N`, then names cut to 12 characters, then the first names and `+N` for the
     rest, then `×N` alone. On a row too narrow even for that, the middle is left empty
   - Right: `time`, how long the session has been running
-- **Row 3: recent sessions**: the three most recently active other sessions in the desktop app, from any project,
-  each in its own box with its title and how long ago it was last active. Clicking a title opens that session.
-  `/toggle-sessions` hides or shows the row. The sessions are read from the desktop app's data folder
-  (`%APPDATA%\Claude` on Windows, `~/Library/Application Support/Claude` on macOS, `~/.config/Claude` on
-  Linux); on a machine without the desktop app the row is not drawn.
+- **Row 3: PRs and diff**, left and right
+  - Left: `pr`, the open pull requests whose branch is this session's branch or one of the worktrees' on row 2
+    (this session's first; at most 10 branches are looked up). Each shows its number, its title and its checks
+    as passed out of the total: `● 2/4` yellow while any are running, `✗ 3/4` red as soon as one fails, `✓ 4/4`
+    green when all pass (skipped and neutral checks count as passed). A draft is dimmed. Clicking a PR opens it.
+    PRs from forks are left out. It checks GitHub every 15 seconds while any checks are running, every 60
+    seconds otherwise, and at once when the branch or the worktrees change. It needs `gh`, signed in, and an
+    `origin` remote on github.com; without the remote `pr` isn't shown, and when `gh` can't answer it reads
+    `pr unavailable`. If a refresh fails after one has worked (offline, say), the last list stays, dimmed
+  - Right: `diff`, the lines added and deleted since the branch left the expected branch (`mainBranch`),
+    uncommitted work and new files included (the lines of the first 200 new files), as `+152 −32`, or `clean`. It compares with the merge-base of
+    `HEAD` and `origin/<mainBranch>` (the local `<mainBranch>` when there's no such remote branch), as the refs
+    stand locally: nothing is fetched
+  - When the row runs out of room, PR titles are cut to 32 characters, then 16, then left out, then the PRs
+    become a count with the worst mark (`×3 ✗`). On a row too narrow even for that, the row is left empty
+- **Row 4: recent sessions**, off unless turned on: the three most recently active other sessions in the
+  desktop app, from any project, each in its own box with its title and how long ago it was last active.
+  Clicking a title opens that session. `/toggle-sessions` shows or hides the row for the session, and
+  `showSessions` turns it on for good. While it's hidden nothing is scanned. The sessions are read from the
+  desktop app's data folder (`%APPDATA%\Claude` on Windows, `~/Library/Application Support/Claude` on macOS,
+  `~/.config/Claude` on Linux); on a machine without the desktop app the row is not drawn.
 
 Bars and percentages go green, yellow, then red as usage rises. After a long gap, a prompt asks whether to
 keep the session timer going.
@@ -62,12 +78,13 @@ Set in the plugin's config:
 | --- | --- | --- |
 | `awayMinutes` | `30` | Minutes without activity before the banner asks whether to keep the session timer going |
 | `mainBranch` | `main` | The branch shown in green; any other branch is shown in yellow |
-| `showSessions` | `true` | Show the row of recent sessions |
+| `showWork` | `true` | Show the row of open PRs and the branch's diff |
+| `showSessions` | `false` | Show the row of recent sessions |
 
 ## Commands
 
 - `/reset-timer` restarts the session timer.
-- `/toggle-sessions` hides or shows the recent-sessions row for the current session, whatever
+- `/toggle-sessions` shows or hides the recent-sessions row for the current session, whatever
   `showSessions` says.
 
 ## Develop

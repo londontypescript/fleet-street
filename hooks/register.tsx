@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderChildren } from 'claude-code'
+import type { EngineInterface, ProcessRunResult, Register, RenderChildren } from 'claude-code'
 
-import type { Away, BgTask, Context, Limit, RecentSession, Worktree } from '../types'
+import type { Away, BgTask, Checks, Context, DiffState, Limit, Pr, PrState, RecentSession, Worktree } from '../types'
 
 const limits = atom({ plugin: 'fleet-street', key: 'limits' } as const, [] as Limit[])
 const context = atom({ plugin: 'fleet-street', key: 'context' } as const, null as Context | null)
@@ -21,6 +21,10 @@ const branch = atom({ plugin: 'fleet-street', key: 'branch' } as const, null as 
 const recent = atom({ plugin: 'fleet-street', key: 'recent' } as const, null as RecentSession[] | null)
 // This session's choice from /toggle-sessions; null follows the showSessions option.
 const sessionsShown = atom({ plugin: 'fleet-street', key: 'sessionsShown' } as const, null as boolean | null)
+// The open PRs from this session's branch and the worktrees' branches; null when the repository isn't on GitHub.
+const prs = atom({ plugin: 'fleet-street', key: 'prs' } as const, null as PrState | null)
+// The branch's diff against the main branch; null outside a git repository or with the work row off.
+const diff = atom({ plugin: 'fleet-street', key: 'diff' } as const, null as DiffState | null)
 
 // The session timer's start lives in the store too, keyed by session, so a resume carries on counting.
 const timerKey = async ($: EngineInterface) => `timer:${await $.session.id()}`
@@ -118,8 +122,25 @@ const fmtAgo = (ms: number) => {
   return h < 24 ? `${h}h` : `${Math.min(99, Math.floor(h / 24))}d`
 }
 
-const truncate = (text: string, max: number) =>
-  max <= 0 ? '' : text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…`
+// East Asian wide characters and emoji take two terminal cells; everything else one. The symbol blocks
+// (misc symbols, dingbats) are counted wide whole: some are narrow, but counting wide only cuts a title sooner.
+const WIDE = /[\u1100-\u115f\u231a\u231b\u23e9-\u23f3\u2600-\u27bf\u2b50\u2b55\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60\uffe0-\uffe6\u{1f000}-\u{1faff}\u{20000}-\u{3fffd}]/u
+const cellsOf = (ch: string) => (WIDE.test(ch) ? 2 : 1)
+const cells = (text: string) => Array.from(text).reduce((w, ch) => w + cellsOf(ch), 0)
+
+// Cut to at most max cells, by characters rather than UTF-16 units, so an emoji is never split in half.
+const truncate = (text: string, max: number) => {
+  if (max <= 0) return ''
+  if (cells(text) <= max) return text
+  let out = ''
+  let used = 0
+  for (const ch of text) {
+    if (used + cellsOf(ch) > max - 1) break
+    out += ch
+    used += cellsOf(ch)
+  }
+  return `${out.trimEnd()}…`
+}
 
 // One entry in the middle of row 2: a worktree, a task, or a count standing for several.
 // count: how many worktrees the entry stands for, so `+N` counts the worktrees it hides.
@@ -212,11 +233,25 @@ async function findSessionsRoot($: EngineInterface): Promise<SessionsRoot | null
 }
 
 let sessionsRoot: SessionsRoot | null | undefined
+// Whether the recent-sessions row is shown (this session's /toggle-sessions choice, else the option); while
+// it is hidden nothing is scanned.
+let sessionsVisible = false
+let recentRunning = false
 
 // The desktop app's own session records (<root>/<account>/<org>/local_*.json), scanned for the latest
 // unarchived sessions other than this one, whatever their folder. Only files changed since the last scan
 // are read again. With no desktop app the list is null and the row is not drawn.
 async function refreshRecent($: EngineInterface) {
+  if (!sessionsVisible || recentRunning) return
+  recentRunning = true
+  try {
+    await scanRecent($)
+  } finally {
+    recentRunning = false
+  }
+}
+
+async function scanRecent($: EngineInterface) {
   if (sessionsRoot === undefined || sessionsRoot === null) sessionsRoot = await findSessionsRoot($)
   if (sessionsRoot === null) {
     if ((await read($, recent)) !== null) await update($, recent, () => null)
@@ -263,72 +298,405 @@ const OPENERS: Record<DesktopOs, (link: string) => string[]> = {
   linux: link => ['xdg-open', link],
 }
 
+// A PR opens in the browser through the same openers. A terminal without OSC 8 links would print a Link's URL
+// after its text, so PRs are Buttons instead. The OS is known only once the desktop app's folder was found;
+// otherwise Windows is told by APPDATA, and macOS's opener is tried before Linux's.
+const openUrl = async ($: EngineInterface, url: string) => {
+  const os = sessionsRoot?.os ?? ((await $.env.get('APPDATA')) ? 'windows' : undefined)
+  const tries = os ? [OPENERS[os](url)] : [OPENERS.macos(url), OPENERS.linux(url)]
+  for (const argv of tries) {
+    const ran = await $.process.run(argv).catch(() => null)
+    if (ran && ran.exitCode === 0) return
+  }
+  $.ui.toast(`Could not open ${url}`)
+}
+
 const openSession = async ($: EngineInterface, link: string) => {
   if (!sessionsRoot) return
   const ran = await $.process.run(OPENERS[sessionsRoot.os](link)).catch(err => ({ exitCode: 1, stderr: String(err) }))
   if (ran.exitCode !== 0) $.ui.toast(`Could not open session: ${ran.stderr.slice(0, 80)}`)
 }
 
-let branchShown: string | null | undefined
+// Set from the options when the session starts.
+let mainBranchName = 'main'
+let workVisible = true
 
-async function refreshBranch($: EngineInterface) {
+const ok = (r: ProcessRunResult | null): r is ProcessRunResult => r !== null && r.exitCode === 0
+type Git = (...args: string[]) => Promise<ProcessRunResult | null>
+
+// The repository the session is in, as the last local refresh found it: its top folder, its GitHub
+// repository (owner/name; null when origin isn't on github.com) and the branches whose PRs the row shows.
+type RepoContext = { top: string; slug: string | null; branches: string[] }
+let repoContext: RepoContext | null = null
+const contextKey = (c: RepoContext | null) => (c ? [c.top, c.slug, ...c.branches].join('\0') : '')
+
+// origin's URL in each of git's spellings: git@github.com:o/n.git, ssh://git@github.com/o/n, https://github.com/o/n.
+const GITHUB_URL = /^(?:git@github\.com:|ssh:\/\/git@github\.com(?::\d+)?\/|https:\/\/(?:[^@/]+@)?github\.com\/)([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/
+const githubSlug = (url: string) => {
+  const m = GITHUB_URL.exec(url.trim())
+  return m ? `${m[1]}/${m[2]}` : null
+}
+
+let branchShown: string | null | undefined
+// undefined until the first publish, which always goes through: the state outlives a hot reload of this module.
+let worktreesShown: string | undefined
+let treesKnown: Worktree[] = []
+let diffShown = ''
+
+let localRunning = false
+let localAgain = false
+
+// Branch, worktrees and diff, read in one pass from the repository's top folder so they always describe
+// the same checkout. One pass runs at a time; a call while one runs asks for one more after it.
+async function refreshLocal($: EngineInterface) {
+  if (localRunning) {
+    localAgain = true
+    return
+  }
+  localRunning = true
+  try {
+    do {
+      localAgain = false
+      await scanLocal($)
+    } while (localAgain)
+  } catch (err) {
+    $.ui.log(`fleet-street: git refresh failed: ${err}`)
+  } finally {
+    localRunning = false
+  }
+}
+
+async function scanLocal($: EngineInterface) {
   const cwd = await $.session.cwd()
-  const git = (...args: string[]) => $.process.run(['git', ...args], { cwd, timeoutMs: 5000 })
+  const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd, timeoutMs: 5000 }).catch(() => null)
+  if (!ok(top)) {
+    await publishLocal($, null, [], null, null)
+    return
+  }
+  // Only git's closing newline is cut: like the worktree paths, this one may end in a space.
+  const topPath = top.stdout.replace(/\r?\n$/, '')
+  const git: Git = (...args) => $.process.run(['git', ...args], { cwd: topPath, timeoutMs: 5000 }).catch(() => null)
+
   let name: string | null = null
-  const current = await git('branch', '--show-current').catch(() => null)
-  if (current && current.exitCode === 0) {
-    name = current.stdout.trim()
-    if (name === '') {
-      const head = await git('rev-parse', '--short', 'HEAD').catch(() => null)
-      name = head && head.exitCode === 0 ? `@${head.stdout.trim()}` : null
+  let onBranch: string | null = null
+  const current = await git('branch', '--show-current')
+  if (ok(current)) {
+    onBranch = current.stdout.trim() || null
+    name = onBranch
+    if (name === null) {
+      const head = await git('rev-parse', '--short', 'HEAD')
+      name = ok(head) ? `@${head.stdout.trim()}` : null
     }
   }
+  const listed = await listWorktrees($, git, topPath)
+  const trees = listed ?? treesKnown
+  const origin = await git('remote', 'get-url', 'origin')
+  const slug = ok(origin) ? githubSlug(origin.stdout) : null
+  const d = workVisible ? await readDiff(git) : null
+  // This session's branch first, then the worktrees' in the order row 2 shows them; detached ones have none.
+  const ordered = [onBranch, ...trees.filter(w => !w.agent).map(w => w.branch), ...trees.filter(w => w.agent).map(w => w.branch)]
+  const branches = [...new Set(ordered.filter((b): b is string => b !== null))].slice(0, PR_BRANCHES)
+  await publishLocal($, name, listed, d, { top: topPath, slug, branches })
+}
+
+// A failed listing (null) keeps the worktrees last shown, so a hiccup neither blanks row 2 nor sets off a PR refresh.
+async function publishLocal($: EngineInterface, name: string | null, trees: Worktree[] | null, d: DiffState | null, ctx: RepoContext | null) {
   if (name !== branchShown) {
     branchShown = name
     await update($, branch, () => name)
   }
+  if (trees !== null) {
+    treesKnown = trees
+    const key = trees.map(w => `${w.path}|${w.name}`).join()
+    if (key !== worktreesShown) {
+      worktreesShown = key
+      await update($, worktrees, () => trees)
+    }
+  }
+  const dk = JSON.stringify(d)
+  if (dk !== diffShown) {
+    diffShown = dk
+    await update($, diff, () => d)
+  }
+  const changed = contextKey(ctx) !== contextKey(repoContext)
+  repoContext = ctx
+  if (changed) void refreshPrs($)
 }
-
-let worktreesShown = ''
-// Each refresh takes the next number; one that finishes after a later one started drops its result.
-let worktreesRun = 0
 
 // `git worktree list --porcelain`: one block per worktree, `worktree <path>` then `branch refs/heads/<name>`
 // or `detached` (named by its folder). The session's own worktree and stale (prunable) ones are left out.
-async function refreshWorktrees($: EngineInterface) {
-  const run = ++worktreesRun
-  const cwd = await $.session.cwd()
-  const git = (...args: string[]) => $.process.run(['git', ...args], { cwd, timeoutMs: 5000 })
-  const top = await git('rev-parse', '--show-toplevel').catch(() => null)
-  const listed = top && top.exitCode === 0 ? await git('worktree', 'list', '--porcelain').catch(() => null) : null
+// null when git can't list them.
+async function listWorktrees($: EngineInterface, git: Git, topPath: string): Promise<Worktree[] | null> {
+  const listed = await git('worktree', 'list', '--porcelain')
+  if (!ok(listed)) return null
   const found: Worktree[] = []
-  if (top && listed && listed.exitCode === 0) {
-    // Only git's closing newline is cut: like the worktree paths below, this one may end in a space.
-    const topPath = top.stdout.replace(/\r?\n$/, '')
-    const here = await realPath($, topPath)
-    // Lines are split but not trimmed: a path may end in a space.
-    for (const block of listed.stdout.split(/\r?\n\r?\n/)) {
-      const lines = block.split(/\r?\n/)
-      const path = lines.find(l => l.startsWith('worktree '))?.slice(9)
-      if (!path || lines.some(l => l === 'bare' || l.startsWith('prunable'))) continue
-      // Only two paths that both resolve can be the same; failing that, the paths as git gives them.
-      const real = await realPath($, path)
-      if (here !== null && real !== null ? real === here : path === topPath) continue
-      const ref = lines.find(l => l.startsWith('branch '))?.slice(7)
-      // A detached worktree has no branch to go by, so its folder names it (a throwaway checkout's
-      // folder says what it is for); the commit only when the folder can't be named.
-      const head = lines.find(l => l.startsWith('HEAD '))?.slice(5, 12)
-      const folder = path.split(/[\\/]/).filter(Boolean).pop()
-      const name = ref ? ref.replace(/^refs\/heads\//, '') : folder ?? (head ? `@${head}` : path)
-      found.push({ path, name, agent: /\/\.claude\/worktrees\/agent-[^/]+$/.test(path) || AGENT_BRANCH.test(name) })
+  const here = await realPath($, topPath)
+  // Lines are split but not trimmed: a path may end in a space.
+  for (const block of listed.stdout.split(/\r?\n\r?\n/)) {
+    const lines = block.split(/\r?\n/)
+    const path = lines.find(l => l.startsWith('worktree '))?.slice(9)
+    if (!path || lines.some(l => l === 'bare' || l.startsWith('prunable'))) continue
+    // Only two paths that both resolve can be the same; failing that, the paths as git gives them.
+    const real = await realPath($, path)
+    if (here !== null && real !== null ? real === here : path === topPath) continue
+    const ref = lines.find(l => l.startsWith('branch '))?.slice(7)
+    // A detached worktree has no branch to go by, so its folder names it (a throwaway checkout's
+    // folder says what it is for); the commit only when the folder can't be named.
+    const head = lines.find(l => l.startsWith('HEAD '))?.slice(5, 12)
+    const folder = path.split(/[\\/]/).filter(Boolean).pop()
+    const onBranch = ref ? ref.replace(/^refs\/heads\//, '') : null
+    const name = onBranch ?? folder ?? (head ? `@${head}` : path)
+    found.push({ path, name, branch: onBranch, agent: /\/\.claude\/worktrees\/agent-[^/]+$/.test(path) || AGENT_BRANCH.test(name) })
+  }
+  return found
+}
+
+// New files' lines are counted for at most this many of them.
+const UNTRACKED_COUNTED = 200
+
+// Lines added and deleted since the branch left the main branch, uncommitted work included: the working tree
+// against the merge-base of HEAD and origin/<main> (the local <main> when there's no such remote branch), as
+// the refs stand locally (nothing is fetched). New files count as added lines; binaries as no lines.
+async function readDiff(git: Git): Promise<DiffState> {
+  const remote = `refs/remotes/origin/${mainBranchName}`
+  const local = `refs/heads/${mainBranchName}`
+  const base = ok(await git('rev-parse', '--verify', '--quiet', `${remote}^{commit}`))
+    ? remote
+    : ok(await git('rev-parse', '--verify', '--quiet', `${local}^{commit}`))
+      ? local
+      : null
+  if (base === null) return { kind: 'unavailable' }
+  const mb = await git('merge-base', 'HEAD', base)
+  if (!ok(mb)) return { kind: 'unavailable' }
+  const numstat = await git('diff', '--numstat', '-z', mb.stdout.trim())
+  if (!ok(numstat) || numstat.isStdoutTruncated) return { kind: 'unavailable' }
+  let added = 0
+  let deleted = 0
+  let files = 0
+  // `<added>\t<deleted>\t<path>\0` per file, `-` for a binary's counts; a rename leaves the path empty and
+  // follows with its old and new paths as tokens of their own.
+  const tokens = numstat.stdout.split('\0')
+  for (let i = 0; i < tokens.length; i++) {
+    const m = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(tokens[i] ?? '')
+    if (!m) continue
+    files++
+    if (m[1] !== '-') added += Number(m[1])
+    if (m[2] !== '-') deleted += Number(m[2])
+    if (m[3] === '') i += 2
+  }
+  const others = await git('ls-files', '--others', '--exclude-standard', '-z')
+  if (!ok(others) || others.isStdoutTruncated) return { kind: 'unavailable' }
+  const untracked = others.stdout.split('\0').filter(Boolean)
+  if (untracked.length > 0) {
+    // `<path>\0<lines>` per text file with any lines; binaries (-I) and empty files are left out, and git
+    // exits 1 when that leaves nothing.
+    const counted = await git('--literal-pathspecs', 'grep', '--untracked', '--no-color', '-I', '-c', '-z', '', '--', ...untracked.slice(0, UNTRACKED_COUNTED))
+    if (counted === null || counted.exitCode > 1 || counted.isStdoutTruncated) return { kind: 'unavailable' }
+    if (counted.exitCode === 0) {
+      for (const line of counted.stdout.split('\n')) {
+        const n = Number(line.split('\0')[1])
+        if (Number.isFinite(n)) added += n
+      }
     }
   }
-  if (run !== worktreesRun) return
-  const key = found.map(w => `${w.path}|${w.name}`).join()
-  if (key !== worktreesShown) {
-    worktreesShown = key
-    await update($, worktrees, () => found)
+  return { kind: 'ok', added, deleted, clean: files === 0 && untracked.length === 0 }
+}
+
+// PRs are looked up for at most this many branches: this session's, then the worktrees'.
+const PR_BRANCHES = 10
+const PR_FIELDS = 'number,title,url,headRefName,isDraft,isCrossRepository,statusCheckRollup'
+// While any shown PR has checks running, then once they've all finished, and after a rate-limit reply.
+const PR_FAST_MS = 15_000
+const PR_SLOW_MS = 60_000
+const PR_BACKOFF_MS = 5 * 60_000
+// A main turn's end refreshes the PRs at most this often.
+const PR_TURN_MS = 15_000
+
+// A check run's conclusion, or a legacy status context's state, that counts as failed or passed.
+const CHECK_FAILED = new Set(['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE', 'STALE', 'ERROR'])
+const CHECK_PASSED = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED'])
+// How each result is drawn, and which wins when a count stands for several PRs.
+const CHECK_MARKS: Record<Checks['state'], { mark: string; color: string | undefined; rank: number }> = {
+  fail: { mark: '✗', color: 'red', rank: 3 },
+  running: { mark: '●', color: 'yellow', rank: 2 },
+  unknown: { mark: '?', color: undefined, rank: 1 },
+  pass: { mark: '✓', color: 'green', rank: 0 },
+}
+
+// statusCheckRollup mixes check runs (`status`, then `conclusion` once COMPLETED) with legacy status
+// contexts (`state`). A failure wins over running checks; a value not known here makes the result unknown.
+const summariseChecks = (rollup: unknown): Checks | null => {
+  if (!Array.isArray(rollup) || rollup.length === 0) return null
+  let passed = 0
+  let failed = 0
+  let running = 0
+  let unknown = 0
+  for (const c of rollup as Record<string, unknown>[]) {
+    const legacy = c.__typename === 'StatusContext' || (c.status === undefined && typeof c.state === 'string')
+    const done = legacy ? c.state !== 'PENDING' && c.state !== 'EXPECTED' : c.status === 'COMPLETED'
+    const result = String((legacy ? c.state : c.conclusion) ?? '')
+    if (!done && (legacy || typeof c.status === 'string')) running++
+    else if (CHECK_PASSED.has(result)) passed++
+    else if (CHECK_FAILED.has(result)) failed++
+    else unknown++
   }
+  const state = failed > 0 ? 'fail' : running > 0 ? 'running' : unknown > 0 ? 'unknown' : 'pass'
+  return { passed, total: rollup.length, state, running: running > 0 }
+}
+
+// Runs fn over the items, at most limit at once, keeping their order.
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length)
+  let next = 0
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++
+      out[i] = await fn(items[i] as T)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return out
+}
+
+let prsRunning = false
+let prsAgain = false
+let prsStartedAt = 0
+// When the clock next refreshes the PRs, and until when a rate-limit reply holds off every refresh.
+let prsDueAt = 0
+let prsBackoffUntil = 0
+// The repository (top folder and slug) the shown PRs belong to, and the reason last logged.
+let prsFor = ''
+let prsLogged = ''
+let prsShown = ''
+
+async function refreshPrs($: EngineInterface) {
+  if (prsRunning) {
+    prsAgain = true
+    return
+  }
+  prsRunning = true
+  try {
+    do {
+      prsAgain = false
+      prsStartedAt = Date.now()
+      // Not due again until this one sets when; otherwise each clock tick while gh runs queues another.
+      prsDueAt = Infinity
+      await scanPrs($)
+    } while (prsAgain && Date.now() >= prsBackoffUntil)
+    // A refresh asked for during a rate-limit backoff waits for the backoff to end.
+    if (prsAgain) prsDueAt = Math.min(prsDueAt, prsBackoffUntil)
+  } catch (err) {
+    $.ui.log(`fleet-street: PR refresh failed: ${err}`)
+    prsDueAt = Date.now() + PR_SLOW_MS
+  } finally {
+    prsRunning = false
+  }
+}
+
+async function setPrs($: EngineInterface, next: PrState | null) {
+  const key = JSON.stringify(next)
+  if (key !== prsShown) {
+    prsShown = key
+    await update($, prs, () => next)
+  }
+}
+
+type PrFail = { kind: 'unavailable' | 'stale' | 'rate'; reason: string }
+
+const classifyGh = (slug: string, ran: { run: ProcessRunResult } | { error: string }): PrFail | null => {
+  if ('error' in ran) {
+    return /tim(e|ed) ?out/i.test(ran.error) ? { kind: 'stale', reason: 'gh timed out' } : { kind: 'unavailable', reason: 'gh could not run' }
+  }
+  if (ran.run.exitCode === 0) return null
+  const err = ran.run.stderr
+  if (/rate limit/i.test(err)) return { kind: 'rate', reason: 'GitHub rate limit' }
+  if (/auth login|not logged in|authenticat|HTTP 401|GH_TOKEN/i.test(err)) return { kind: 'unavailable', reason: 'gh not signed in' }
+  if (/Could not resolve to a Repository|HTTP 403|HTTP 404/i.test(err)) return { kind: 'unavailable', reason: `no access to ${slug}` }
+  return { kind: 'stale', reason: err.trim().split(/\r?\n/)[0]?.slice(0, 80) || `gh exited ${ran.run.exitCode}` }
+}
+
+// One `gh pr list --head` per branch, so a repository with hundreds of open PRs can't push these off the first
+// page. PRs from forks are dropped: a fork's branch may share a name with one here.
+async function scanPrs($: EngineInterface) {
+  const ctx = repoContext
+  const key = contextKey(ctx)
+  if (!workVisible || ctx === null || ctx.slug === null) {
+    prsFor = ''
+    prsDueAt = Date.now() + PR_SLOW_MS
+    await setPrs($, null)
+    return
+  }
+  const slug = ctx.slug
+  const repo = `${ctx.top}\0${slug}`
+  const shown = await read($, prs)
+  // Only the branches changed: keep what's known for those still here until the answer lands.
+  if (repo === prsFor && shown?.kind === 'ok') {
+    await setPrs($, { ...shown, prs: shown.prs.filter(p => ctx.branches.includes(p.branch)) })
+  } else if (repo !== prsFor) {
+    prsFor = repo
+    await setPrs($, { kind: 'loading' })
+  }
+
+  const answers = await mapLimit(ctx.branches, 4, b =>
+    $.process
+      .run(['gh', 'pr', 'list', '-R', slug, '--head', b, '--state', 'open', '--limit', '20', '--json', PR_FIELDS], {
+        cwd: ctx.top,
+        timeoutMs: 15_000,
+        env: { GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' },
+      })
+      .then(run => ({ run }), err => ({ error: String(err) })),
+  )
+  // The repository or branches changed while gh ran; the refresh that change asked for follows.
+  if (contextKey(repoContext) !== key) return
+
+  const found: Pr[] = []
+  let failed: PrFail | null = null
+  // An unavailable answer outranks a rate limit, which outranks a passing failure.
+  const rank = { unavailable: 3, rate: 2, stale: 1 }
+  for (const [i, ran] of answers.entries()) {
+    const branchName = ctx.branches[i] as string
+    let f = classifyGh(slug, ran)
+    if (f === null && 'run' in ran) {
+      try {
+        const list = JSON.parse(ran.run.stdout) as Record<string, unknown>[]
+        for (const p of list) {
+          if (p.isCrossRepository || p.headRefName !== branchName || found.some(x => x.number === p.number)) continue
+          found.push({
+            number: Number(p.number),
+            title: String(p.title ?? '').replace(/\s+/g, ' ').trim(),
+            url: String(p.url ?? ''),
+            branch: branchName,
+            draft: Boolean(p.isDraft),
+            checks: summariseChecks(p.statusCheckRollup),
+          })
+        }
+      } catch {
+        f = { kind: 'stale', reason: 'gh gave an unreadable reply' }
+      }
+    }
+    if (f && (!failed || rank[f.kind] > rank[failed.kind])) failed = f
+  }
+
+  const now = Date.now()
+  if (failed === null) {
+    prsLogged = ''
+    prsDueAt = now + (found.some(p => p.checks?.running) ? PR_FAST_MS : PR_SLOW_MS)
+    await setPrs($, { kind: 'ok', prs: found, stale: false })
+    return
+  }
+  if (failed.reason !== prsLogged) {
+    prsLogged = failed.reason
+    $.ui.log(`fleet-street: PRs unavailable: ${failed.reason}`)
+  }
+  prsDueAt = now + (failed.kind === 'rate' ? PR_BACKOFF_MS : PR_SLOW_MS)
+  if (failed.kind === 'rate') prsBackoffUntil = prsDueAt
+  const current = await read($, prs)
+  await setPrs(
+    $,
+    failed.kind !== 'unavailable' && current?.kind === 'ok'
+      ? { ...current, stale: true }
+      : { kind: 'unavailable', reason: failed.reason },
+  )
 }
 
 async function setTimer($: EngineInterface, start: number) {
@@ -346,7 +714,10 @@ async function markActive($: EngineInterface, t: number) {
 export const register: Register = (on, options) => {
   const awayMs = Number(options.awayMinutes ?? 30) * 60_000
   const mainBranch = String(options.mainBranch ?? 'main')
-  const showSessions = options.showSessions !== false
+  const showSessions = options.showSessions === true
+  const workOn = options.showWork !== false
+  workVisible = workOn
+  mainBranchName = mainBranch
   // Mirrors of state the timer needs, so it can decide whether a redraw would change anything.
   let lastAt: number | null = null
   let ttl = TTL_API_MS
@@ -373,16 +744,14 @@ export const register: Register = (on, options) => {
       name: 'toggle-sessions',
       description: 'Hide or show the recent-sessions row in the fleet-street banner for this session',
     })
-    void refreshBranch($)
-    void refreshWorktrees($)
+    sessionsVisible = (await read($, sessionsShown)) ?? showSessions
+    void refreshLocal($)
     void refreshRecent($).catch(err => $.ui.log(`fleet-street: recent sessions failed: ${err}`))
     $.clock.every(1000, () => {
       const t = Date.now()
       // A checkout made outside the session (another terminal) shows within five seconds.
-      if (Math.floor(t / 1000) % 5 === 0) {
-        void refreshBranch($)
-        void refreshWorktrees($)
-      }
+      if (Math.floor(t / 1000) % 5 === 0) void refreshLocal($)
+      if (workVisible && t >= prsDueAt) void refreshPrs($)
       if (Math.floor(t / 1000) % 15 === 0) void refreshRecent($).catch(() => {})
       const left = lastAt === null ? Infinity : lastAt + ttl - t
       const key = left > 0 && left <= FINAL_COUNTDOWN_MS ? `s${Math.floor(t / 1000)}` : `m${Math.floor(t / 60_000)}:${left > 0}`
@@ -402,6 +771,8 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'toggle-sessions' }, async $ => {
     const shown = !((await read($, sessionsShown)) ?? showSessions)
     await update($, sessionsShown, () => shown)
+    sessionsVisible = shown
+    if (shown) void refreshRecent($).catch(() => {})
     return { text: shown ? 'Recent sessions shown.' : 'Recent sessions hidden.' }
   })
 
@@ -501,8 +872,9 @@ export const register: Register = (on, options) => {
       await update($, lastResponseAt, () => at)
       await update($, now, () => at)
       await markActive($, at)
-      await refreshBranch($)
-      await refreshWorktrees($)
+      // Not awaited: a slow git or gh never holds up the turn.
+      void refreshLocal($)
+      if (workVisible && at - prsStartedAt >= PR_TURN_MS && at >= prsBackoffUntil) void refreshPrs($)
     }
     return next(e)
   })
@@ -524,6 +896,8 @@ export const register: Register = (on, options) => {
     const bg = await read($, bgTasks)
     const sessions = await read($, recent)
     const sessionsOn = (await read($, sessionsShown)) ?? showSessions
+    const prState = await read($, prs)
+    const diffState = await read($, diff)
 
     // Spacing comes from Box gaps, not spaces inside Text: the desktop surface trims those.
     const sep = <Text dimColor>│</Text>
@@ -741,7 +1115,81 @@ export const register: Register = (on, options) => {
         </Box>
       ) : null
 
-    if (!awayLine && !statusLine && !recentLine) {
+    // The work row: the open PRs on the left, each with its checks passed out of the total, and the branch's
+    // diff against the main branch on the right. Squeezed one step at a time until the whole row fits: titles
+    // cut to 32, then to 16, then numbers alone, then a count with the worst mark; failing that, left empty.
+    const len = cells
+    const prLabel = (p: Pr, max: number | null) => (max === null || p.title === '' ? `#${p.number}` : `#${p.number} ${truncate(p.title, max)}`)
+    const checksLabel = (c: Checks) => `${CHECK_MARKS[c.state].mark} ${c.passed}/${c.total}`
+    const prWidth = (p: Pr, max: number | null) => len(prLabel(p, max)) + (p.checks ? 1 + len(checksLabel(p.checks)) : 0)
+    const listed = prState?.kind === 'ok' ? prState.prs : []
+    const stale = prState?.kind === 'ok' && prState.stale
+    const worstState = listed.reduce<Checks['state'] | null>(
+      (w, p) => (p.checks && (w === null || CHECK_MARKS[p.checks.state].rank > CHECK_MARKS[w].rank) ? p.checks.state : w),
+      null,
+    )
+    const quiet = (text: string) => <Text dimColor>{text}</Text>
+    const prSection = (body: RenderChildren[]) => (
+      <Box flexWrap="nowrap" columnGap={1}>
+        <Text bold>pr</Text>
+        {body}
+      </Box>
+    )
+    const markText = (state: Checks['state'], text: string) => (
+      <Text color={stale ? undefined : CHECK_MARKS[state].color} dimColor={stale || state === 'unknown'}>
+        {text}
+      </Text>
+    )
+    // Each form: its width in cells and what it draws.
+    const prForms: [number, RenderChildren][] = []
+    if (prState?.kind === 'loading') prForms.push([4, prSection([quiet('…')])])
+    else if (prState?.kind === 'unavailable') prForms.push([14, prSection([quiet('unavailable')])])
+    else if (prState?.kind === 'ok' && listed.length === 0) prForms.push([7, prSection([quiet('none')])])
+    else if (prState?.kind === 'ok') {
+      for (const max of [32, 16, null]) {
+        const width = 2 + listed.reduce((w, p) => w + 1 + prWidth(p, max), 0) + 2 * (listed.length - 1)
+        const items = listed.map(p => (
+          <Box key={`pr:${p.number}`} flexWrap="nowrap" columnGap={1}>
+            <Button key={`p:${p.number}`} label={prLabel(p, max)} plain dimColor={p.draft || stale} onPress={() => openUrl($, p.url)} />
+            {p.checks ? markText(p.checks.state, checksLabel(p.checks)) : null}
+          </Box>
+        ))
+        prForms.push([width, prSection(items.flatMap((x, i) => (i === 0 ? [x] : [sep, x])))])
+      }
+      const count = `×${listed.length}`
+      const mark = worstState ? CHECK_MARKS[worstState].mark : ''
+      prForms.push([3 + len(count) + (mark ? 1 + len(mark) : 0), prSection([<Text key="n">{count}</Text>, worstState ? markText(worstState, mark) : null])])
+    }
+
+    const diffText: string[] =
+      diffState?.kind === 'ok' ? (diffState.clean ? ['clean'] : [`+${diffState.added}`, `−${diffState.deleted}`]) : ['unavailable']
+    const diffWidth = diffState === null ? 0 : 5 + len(mainBranch) + diffText.reduce((w, x) => w + 1 + len(x), 0)
+    const diffPart =
+      diffState === null ? null : (
+        <Box flexWrap="nowrap" columnGap={1}>
+          <Text bold>diff</Text>
+          <Text dimColor>{mainBranch}</Text>
+          {diffState.kind === 'ok' && !diffState.clean ? (
+            <Box columnGap={1}>
+              <Text color="green">{diffText[0]}</Text>
+              <Text color="red">{diffText[1]}</Text>
+            </Box>
+          ) : (
+            quiet(diffText.join(' '))
+          )}
+        </Box>
+      )
+    const workFits = (w: number) => w * scale <= e.props.bodyColumns
+    const prPart = prForms.length === 0 ? null : prForms.find(([w]) => workFits(w + (diffPart ? diffWidth + 1 : 0)))?.[1]
+    const workLine =
+      !workOn || (prForms.length === 0 && diffPart === null) || (prForms.length > 0 && !prPart) || !workFits(diffWidth) ? null : (
+        <Box width="100%" flexWrap="nowrap" justifyContent="space-between" columnGap={1}>
+          {prPart ?? <Box />}
+          {diffPart}
+        </Box>
+      )
+
+    if (!awayLine && !statusLine && !workLine && !recentLine) {
       return firstLine
     }
 
@@ -750,6 +1198,7 @@ export const register: Register = (on, options) => {
         {firstLine}
         {awayLine}
         {statusLine}
+        {workLine}
         {recentLine}
       </Box>
     )
