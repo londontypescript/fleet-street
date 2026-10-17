@@ -1199,19 +1199,32 @@ export const register: Register = (on, options) => {
     // squeezed one step at a time until the row fits, and left out when even the last step doesn't.
     type Part = { text: string; color?: string; dim?: boolean; press?: () => void }
     type Piece = { key: string; parts: Part[] }
-    // The label, then each entry with the gap before it, its parts with a gap between each, and each │ with
-    // the gap after it.
+    // The label, then each entry with the gap before it, its parts with a gap between each, each pressable
+    // part's frame (a border and a column of padding each side), and each │ with the gap after it.
     const piecesWidth = (label: string, pieces: Piece[]): Width => ({
       text: cells(label) + pieces.reduce((w, p) => w + p.parts.reduce((n, x) => n + cells(x.text), 0), 0) + Math.max(0, pieces.length - 1),
-      gaps: pieces.reduce((w, p) => w + 1 + p.parts.length - 1, 0) + Math.max(0, pieces.length - 1),
+      gaps:
+        pieces.reduce((w, p) => w + 1 + p.parts.length - 1 + 4 * p.parts.filter(x => x.press).length, 0) +
+        Math.max(0, pieces.length - 1),
     })
+    // A pressable part (a PR's title) is framed like a recent-sessions cell, so it reads as a button; its row
+    // is then three lines tall.
     const drawPieces = (pieces: Piece[]) =>
       pieces.flatMap((p, i) => {
         const piece = (
-          <Box key={p.key} flexWrap="nowrap" columnGap={1}>
+          <Box key={p.key} flexWrap="nowrap" alignItems="center" columnGap={1}>
             {p.parts.map((x, j) =>
               x.press ? (
-                <Button key={`${p.key}:${j}`} label={x.text} plain dimColor={x.dim} onPress={x.press} />
+                <Box
+                  key={`f:${p.key}:${j}`}
+                  flexWrap="nowrap"
+                  borderStyle="round"
+                  borderDimColor
+                  hover={{ borderDimColor: false }}
+                  paddingX={1}
+                >
+                  <Button key={`${p.key}:${j}`} label={x.text} plain dimColor={x.dim} onPress={x.press} />
+                </Box>
               ) : (
                 <Text key={`${p.key}:${j}`} color={x.color} dimColor={x.dim}>
                   {x.text}
@@ -1230,8 +1243,14 @@ export const register: Register = (on, options) => {
       const squeezed = fit !== layouts[0]
       const [first, ...rest] = drawPieces(fit)
       return (
-        <Box width={squeezed ? '100%' : undefined} flexWrap="nowrap" justifyContent={squeezed ? 'space-between' : undefined} columnGap={1}>
-          <Box flexWrap="nowrap" columnGap={1}>
+        <Box
+          width={squeezed ? '100%' : undefined}
+          flexWrap="nowrap"
+          alignItems="center"
+          justifyContent={squeezed ? 'space-between' : undefined}
+          columnGap={1}
+        >
+          <Box flexWrap="nowrap" alignItems="center" columnGap={1}>
             <Text bold>{label}</Text>
             {first}
           </Box>
@@ -1442,18 +1461,16 @@ export const register: Register = (on, options) => {
       (w, p) => (p.checks && (w === null || CHECK_MARKS[p.checks.state].rank > CHECK_MARKS[w].rank) ? p.checks.state : w),
       null,
     )
-    const prLine =
-      prList.length === 0
-        ? null
-        : fullLine(
-            listPart('pr', [
-              prList.map(p => prPiece(p, Infinity)),
-              prList.map(p => prPiece(p, 32)),
-              prList.map(p => prPiece(p, 16)),
-              prList.map(p => prPiece(p, null)),
-              [countPiece(prList.length, undefined, ...(worstCheck ? [checksPart(worstCheck, CHECK_MARKS[worstCheck].mark)] : []))],
-            ]),
-          )
+    const prLayouts = [
+      prList.map(p => prPiece(p, Infinity)),
+      prList.map(p => prPiece(p, 32)),
+      prList.map(p => prPiece(p, 16)),
+      prList.map(p => prPiece(p, null)),
+      [countPiece(prList.length, undefined, ...(worstCheck ? [checksPart(worstCheck, CHECK_MARKS[worstCheck].mark)] : []))],
+    ]
+    const prLine = prList.length === 0 ? null : fullLine(listPart('pr', prLayouts))
+    // Three lines tall unless squeezed to its last layout, `×N`, which has no title to frame.
+    const prTall = prLayouts.find(ps => fits(piecesWidth('pr', ps)))?.some(p => p.parts.some(x => x.press)) ?? false
 
     // Recent sessions: three equal rounded cells spread edge to edge, each with its title and age
     // together in the middle. The terminal cuts a title to the cell's columns; a desktop draws a proportional
@@ -1496,9 +1513,10 @@ export const register: Register = (on, options) => {
 
     // A blank line between rows while they all fit in the rows the band may take; packed tight when they don't,
     // so the list rows stay in view instead of scrolling behind the band's `n more`. Each row is one line but
-    // the recent-sessions cells, which take three; the blank lines go between rows.
+    // the framed ones (the pr row while its titles are drawn, and the recent-sessions cells), which take
+    // three; the blank lines go between rows.
     const shown = [awayLine, statusLine, agLine, bgLine, prLine, recentLine].filter(Boolean).length + 1
-    const height = shown + (recentLine && sessions !== null && sessions.length > 0 ? 2 : 0)
+    const height = shown + (prLine && prTall ? 2 : 0) + (recentLine && sessions !== null && sessions.length > 0 ? 2 : 0)
     const spacing = height + shown - 1 <= e.props.maxRows ? 1 : 0
 
     return (

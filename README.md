@@ -46,8 +46,8 @@ Usage and Status Banner Plugin for Claude
   - `pr`: the open pull requests whose branch is this session's branch or one of the worktrees' (this
     session's first; at most 10 branches are looked up). Each shows its number, its title and its checks as
     passed out of the total: `● 2/4` yellow while any are running, `✗ 3/4` red as soon as one fails, `✓ 4/4`
-    green when all pass (skipped and neutral checks count as passed). A draft is dimmed. Clicking a PR opens it.
-    PRs from forks are left out. It checks GitHub every 15 seconds while any checks are running, every 60
+    green when all pass (skipped and neutral checks count as passed). A draft is dimmed. Each title is framed
+    as a button; clicking it opens the PR. PRs from forks are left out. It checks GitHub every 15 seconds while any checks are running, every 60
     seconds otherwise, and at once when the branch or the worktrees change. It needs `gh`, signed in, and an
     `origin` remote on github.com; when `gh` can't answer there's no row. If a refresh fails after one has
     worked (offline, say), the last list stays, dimmed. Squeezed: titles cut to 32, then 16, then left out,
