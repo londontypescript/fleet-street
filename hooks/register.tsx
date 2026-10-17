@@ -1461,18 +1461,16 @@ export const register: Register = (on, options) => {
       (w, p) => (p.checks && (w === null || CHECK_MARKS[p.checks.state].rank > CHECK_MARKS[w].rank) ? p.checks.state : w),
       null,
     )
-    const prLine =
-      prList.length === 0
-        ? null
-        : fullLine(
-            listPart('pr', [
-              prList.map(p => prPiece(p, Infinity)),
-              prList.map(p => prPiece(p, 32)),
-              prList.map(p => prPiece(p, 16)),
-              prList.map(p => prPiece(p, null)),
-              [countPiece(prList.length, undefined, ...(worstCheck ? [checksPart(worstCheck, CHECK_MARKS[worstCheck].mark)] : []))],
-            ]),
-          )
+    const prLayouts = [
+      prList.map(p => prPiece(p, Infinity)),
+      prList.map(p => prPiece(p, 32)),
+      prList.map(p => prPiece(p, 16)),
+      prList.map(p => prPiece(p, null)),
+      [countPiece(prList.length, undefined, ...(worstCheck ? [checksPart(worstCheck, CHECK_MARKS[worstCheck].mark)] : []))],
+    ]
+    const prLine = prList.length === 0 ? null : fullLine(listPart('pr', prLayouts))
+    // Three lines tall unless squeezed to its last layout, `×N`, which has no title to frame.
+    const prTall = prLayouts.find(ps => fits(piecesWidth('pr', ps)))?.some(p => p.parts.some(x => x.press)) ?? false
 
     // Recent sessions: three equal rounded cells spread edge to edge, each with its title and age
     // together in the middle. The terminal cuts a title to the cell's columns; a desktop draws a proportional
@@ -1515,10 +1513,10 @@ export const register: Register = (on, options) => {
 
     // A blank line between rows while they all fit in the rows the band may take; packed tight when they don't,
     // so the list rows stay in view instead of scrolling behind the band's `n more`. Each row is one line but
-    // the framed ones (the pr row while a PR's title is a button, and the recent-sessions cells), which take
+    // the framed ones (the pr row while its titles are drawn, and the recent-sessions cells), which take
     // three; the blank lines go between rows.
     const shown = [awayLine, statusLine, agLine, bgLine, prLine, recentLine].filter(Boolean).length + 1
-    const height = shown + (prLine ? 2 : 0) + (recentLine && sessions !== null && sessions.length > 0 ? 2 : 0)
+    const height = shown + (prLine && prTall ? 2 : 0) + (recentLine && sessions !== null && sessions.length > 0 ? 2 : 0)
     const spacing = height + shown - 1 <= e.props.maxRows ? 1 : 0
 
     return (
