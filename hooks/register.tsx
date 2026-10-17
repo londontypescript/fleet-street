@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ProcessRunResult, Register, RenderChildren } from 'claude-code'
 
-import type { Away, BgTask, Checks, Context, DiffState, Limit, Pr, PrState, RecentSession, Worktree } from '../types'
+import type { Away, BgTask, Checks, Context, DiffState, Limit, Pr, PrState, RecentSession, Subagent, Worktree } from '../types'
 
 const limits = atom({ plugin: 'fleet-street', key: 'limits' } as const, [] as Limit[])
 const context = atom({ plugin: 'fleet-street', key: 'context' } as const, null as Context | null)
@@ -13,6 +13,8 @@ const away = atom({ plugin: 'fleet-street', key: 'away' } as const, null as Away
 const worktrees = atom({ plugin: 'fleet-street', key: 'worktrees' } as const, [] as Worktree[])
 // Background shells and monitors (background subagents are left out).
 const bgTasks = atom({ plugin: 'fleet-street', key: 'bgTasks' } as const, [] as BgTask[])
+// This session's subagents, running or lately finished.
+const agents = atom({ plugin: 'fleet-street', key: 'agents' } as const, [] as Subagent[])
 // The session folder's branch, `@<hash>` on a detached HEAD, null outside a git repository.
 const branch = atom({ plugin: 'fleet-street', key: 'branch' } as const, null as string | null)
 
@@ -90,12 +92,15 @@ let lastActive: number | null = null
 
 let bgCount = 0
 
-// `cd repo && npm run dev -- --port 3000` → `npm run dev -- --port…`
+// `cd repo && npm run dev -- --port 3000` → `npm run dev -- --port 3000`: a task's label when its call gave no
+// description. The row cuts labels to fit.
 const shortCommand = (command: string) => {
   const last = command.split(/\s*&&\s*/).filter(part => !/^cd\s/.test(part.trim())).pop() ?? command
-  const flat = last.replace(/\s+/g, ' ').trim()
-  return flat.length > 22 ? `${flat.slice(0, 21)}…` : flat
+  return last.replace(/\s+/g, ' ').trim()
 }
+// A task by the description its call gave (what the app's own task list shows), else its command.
+const taskLabel = (description: string | undefined, command: string) =>
+  description?.replace(/\s+/g, ' ').trim() || shortCommand(command)
 
 async function setBgTasks($: EngineInterface, fn: (list: BgTask[]) => BgTask[]) {
   await update($, bgTasks, list => {
@@ -110,6 +115,90 @@ async function endTasksIn($: EngineInterface, text: string) {
   if (bgCount === 0 || !text.includes('<task-notification')) return
   const ids = new Set([...text.matchAll(/<task-id>([^<]+)<\/task-id>/g)].map(m => m[1].trim()))
   if (ids.size > 0) await setBgTasks($, list => list.filter(b => !ids.has(b.id)))
+}
+
+const capitalise = (word: string) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+// Effort levels as the banner shortens them.
+const EFFORT_SHORT: Record<string, string> = { low: 'Low', medium: 'Med', high: 'High', xhigh: 'XHigh', max: 'Max' }
+// A model by its family: claude-opus-5-5 → Opus, gpt-6.1-sol → Sol; anything else cut to 10.
+const modelFamily = (model: string) => {
+  const claude = /(opus|sonnet|haiku|fable)/i.exec(model)?.[1]
+  if (claude) return capitalise(claude)
+  const gpt = /gpt-[\d.]+-([a-z]+)/i.exec(model)?.[1]
+  return gpt ? capitalise(gpt) : truncate(model, 10)
+}
+// 'Opus High', 'Sonnet Med', or the family alone until the effort is known; undefined until the model is.
+const modelLabel = (model: string | undefined, effort: string | undefined) =>
+  model === undefined ? undefined : effort ? `${modelFamily(model)} ${EFFORT_SHORT[effort] ?? effort}` : modelFamily(model)
+
+// A run of another provider's agent through the Codex CLI (codex-locked, or codex exec): its model from
+// -m/--model and its effort from model_reasoning_effort, as 'Sol High'; undefined for any other command.
+const codexModel = (command: string) => {
+  if (!/\bcodex-locked\b|\bcodex\s+(?:-\S+\s+)*exec\b/.test(command)) return undefined
+  const model = /(?:^|\s)(?:-m|--model)(?:\s+|=)['"]?([\w.-]+)/.exec(command)?.[1] ?? 'codex'
+  const effort = /model_reasoning_effort\s*=\s*['"]*([a-z]+)/.exec(command)?.[1]
+  return modelLabel(model, effort)
+}
+
+// What each subagent's steps and tool calls have shown of its model and effort, by agent id. Only read from
+// events as they pass: nothing hooks a subagent's start, which crashed the mod for subagents in worktrees.
+const agentModels = new Map<string, string>()
+const agentEfforts = new Map<string, string>()
+// When each agent was first seen, and first seen finished.
+const agentSeen = new Map<string, { firstSeen: number; endedAt?: number }>()
+const FINISHED = new Set(['completed', 'failed', 'killed'])
+// A finished subagent stays on the row this long, so a quick one is still seen.
+const AGENT_DONE_MS = 2 * 60_000
+
+let agentsShown: string | undefined
+let agentsRunning = false
+let agentsFailed = false
+
+// The session's subagents from the engine's own list, polled: running ones, and finished ones for two minutes.
+async function refreshAgents($: EngineInterface) {
+  if (agentsRunning) return
+  agentsRunning = true
+  try {
+    const t = Date.now()
+    const list = await $.agent.list()
+    const found: Subagent[] = []
+    const ids = new Set<string>()
+    for (const a of list) {
+      ids.add(a.id)
+      let seen = agentSeen.get(a.id)
+      if (!seen) {
+        seen = { firstSeen: t }
+        agentSeen.set(a.id, seen)
+      }
+      if (FINISHED.has(a.status)) seen.endedAt ??= t
+      if (seen.endedAt !== undefined && t - seen.endedAt > AGENT_DONE_MS) continue
+      found.push({
+        id: a.id,
+        description: (a.description || a.name || a.type).replace(/\s+/g, ' ').trim(),
+        status: a.status,
+        model: modelLabel(agentModels.get(a.id), agentEfforts.get(a.id)),
+        firstSeen: seen.firstSeen,
+        endedAt: seen.endedAt,
+      })
+    }
+    for (const id of [...agentSeen.keys()]) {
+      if (ids.has(id)) continue
+      agentSeen.delete(id)
+      agentModels.delete(id)
+      agentEfforts.delete(id)
+    }
+    agentsFailed = false
+    const key = JSON.stringify(found)
+    if (key !== agentsShown) {
+      agentsShown = key
+      await update($, agents, () => found)
+    }
+  } catch (err) {
+    if (!agentsFailed) $.ui.log(`fleet-street: agent list failed: ${err}`)
+    agentsFailed = true
+  } finally {
+    agentsRunning = false
+  }
 }
 
 const RECENT_COUNT = 3
@@ -142,32 +231,11 @@ const truncate = (text: string, max: number) => {
   return `${out.trimEnd()}…`
 }
 
-// One entry in the middle of row 2: a worktree, a task, or a count standing for several.
-// count: how many worktrees the entry stands for, so `+N` counts the worktrees it hides.
-type MidItem = { key: string; text: string; color: string; note?: string; count?: number }
-
-// `wt a │ b │ bg none`: each label and entry with the column before it, and each │ with the one after it. An empty
-// section reads `none`; a hidden one (null) takes no room.
-const sectionWidth = (label: string, items: MidItem[] | null) =>
-  items === null
-    ? 0
-    : items.length === 0
-      ? label.length + 5
-      : label.length + items.reduce((w, x) => w + 1 + x.text.length + (x.note ? x.note.length + 1 : 0), 0) + 2 * (items.length - 1)
-const middleWidth = (wt: MidItem[] | null, bg: MidItem[]) => {
-  const a = sectionWidth('wt', wt)
-  return a + sectionWidth('bg', bg) + (a > 0 ? 3 : 0)
-}
-
 // A desktop draws proportional text, which takes about this share of the cells its length suggests.
 const DESKTOP_TEXT_SCALE = 0.85
 
-// The app names a subagent's worktree branch worktree-agent-<id>; the first seven of the id tell them apart.
+// The app names a subagent's worktree branch worktree-agent-<id>.
 const AGENT_BRANCH = /^worktree-agent-([0-9a-f]{7})[0-9a-f]*$/
-const agentName = (name: string) => {
-  const m = AGENT_BRANCH.exec(name)
-  return m ? `agent-${m[1]}` : name
-}
 
 // Each recent session's cell takes the same share of the row; the gaps between them take the rest.
 const CELL_PERCENT = 32
@@ -516,6 +584,16 @@ const PR_TURN_MS = 15_000
 const CHECK_FAILED = new Set(['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE', 'STALE', 'ERROR'])
 const CHECK_PASSED = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED'])
 // How each result is drawn, and which wins when a count stands for several PRs.
+// How a subagent's status is drawn, and which wins when one mark stands for several.
+const AGENT_MARKS: Record<Subagent['status'], { mark: string; color: string | undefined; rank: number }> = {
+  failed: { mark: '✗', color: 'red', rank: 4 },
+  killed: { mark: '✗', color: 'red', rank: 4 },
+  running: { mark: '●', color: 'yellow', rank: 3 },
+  pending: { mark: '○', color: undefined, rank: 2 },
+  waiting: { mark: '○', color: undefined, rank: 2 },
+  idle: { mark: '○', color: undefined, rank: 1 },
+  completed: { mark: '✓', color: 'green', rank: 0 },
+}
 const CHECK_MARKS: Record<Checks['state'], { mark: string; color: string | undefined; rank: number }> = {
   fail: { mark: '✗', color: 'red', rank: 3 },
   running: { mark: '●', color: 'yellow', rank: 2 },
@@ -746,11 +824,13 @@ export const register: Register = (on, options) => {
     })
     sessionsVisible = (await read($, sessionsShown)) ?? showSessions
     void refreshLocal($)
+    void refreshAgents($)
     void refreshRecent($).catch(err => $.ui.log(`fleet-street: recent sessions failed: ${err}`))
     $.clock.every(1000, () => {
       const t = Date.now()
       // A checkout made outside the session (another terminal) shows within five seconds.
       if (Math.floor(t / 1000) % 5 === 0) void refreshLocal($)
+      if (Math.floor(t / 1000) % 2 === 0) void refreshAgents($)
       if (workVisible && t >= prsDueAt) void refreshPrs($)
       if (Math.floor(t / 1000) % 15 === 0) void refreshRecent($).catch(() => {})
       const left = lastAt === null ? Infinity : lastAt + ttl - t
@@ -795,7 +875,7 @@ export const register: Register = (on, options) => {
     // Started in the background, or pushed there with Ctrl+B while it ran.
     const id = result.result && !result.isError ? result.result.backgroundTaskId : undefined
     if (id) {
-      const task: BgTask = { id, label: shortCommand(e.command), startedAt }
+      const task: BgTask = { id, label: taskLabel(e.description, e.command), startedAt, model: codexModel(e.command) }
       await setBgTasks($, list => [...list.filter(b => b.id !== id), task])
     }
     return result
@@ -805,7 +885,7 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     const id = result.result && !result.isError ? result.result.taskId : undefined
     if (id) {
-      const task: BgTask = { id, label: `monitor ${e.description}`.slice(0, 22), startedAt: Date.now() }
+      const task: BgTask = { id, label: `monitor ${e.description}`, startedAt: Date.now() }
       await setBgTasks($, list => [...list.filter(b => b.id !== id), task])
     }
     return result
@@ -840,11 +920,26 @@ export const register: Register = (on, options) => {
         const seen = new Set(kept.map(b => b.id))
         const found = live
           .filter(l => !seen.has(l.id))
-          .map(l => ({ id: l.id, label: shortCommand(l.command ?? l.description), startedAt: Date.now() }))
+          .map(l => ({
+            id: l.id,
+            label: taskLabel(l.description, l.command ?? ''),
+            startedAt: Date.now(),
+            model: l.command ? codexModel(l.command) : undefined,
+          }))
         return found.length === 0 && kept.length === list.length ? list : [...kept, ...found]
       })
     }
     return result
+  })
+
+  // A subagent's tool call carries its id and the effort it runs at.
+  on('classic.PostToolUse', async ($, e, next) => {
+    const level = e.effort?.level
+    if (e.agent_id && level && agentEfforts.get(e.agent_id) !== level) {
+      agentEfforts.set(e.agent_id, level)
+      void refreshAgents($)
+    }
+    return next(e)
   })
 
   on('session.measure', async ($, e, next) => {
@@ -856,6 +951,12 @@ export const register: Register = (on, options) => {
 
   on('turn.step', async function* ($, e, next) {
     const result = yield* next(e)
+    // A subagent's step names the model it ran on; only noted here, the agent list's refresh draws it.
+    const model = e.agentId !== undefined ? result.usage?.model : undefined
+    if (e.agentId !== undefined && model && agentModels.get(e.agentId) !== model) {
+      agentModels.set(e.agentId, model)
+      void refreshAgents($)
+    }
     if (e.agentId === undefined) {
       const at = Date.now()
       lastAt = at
@@ -894,6 +995,7 @@ export const register: Register = (on, options) => {
     const trees = await read($, worktrees)
     const onBranch = await read($, branch)
     const bg = await read($, bgTasks)
+    const subagents = await read($, agents)
     const sessions = await read($, recent)
     const sessionsOn = (await read($, sessionsShown)) ?? showSessions
     const prState = await read($, prs)
@@ -981,102 +1083,231 @@ export const register: Register = (on, options) => {
       ) : null
 
     // Under a minute reads <1m, so the banner keeps its once-a-minute redraw.
-    const age = (startedAt: number) => (t - startedAt < 60_000 ? '<1m' : fmtElapsed(t - startedAt))
-    // The second line's outer columns share one width, so the middle one sits at the true centre.
-    const elapsed = started !== null ? fmtElapsed(t - started) : null
-    const sideWidth = Math.max(onBranch ? onBranch.length + 3 : 0, elapsed ? elapsed.length + 5 : 0)
-    // The middle's room in character cells; a desktop's proportional text takes fewer than its length.
-    const room = e.props.bodyColumns - 2 * sideWidth - 2
+    const span = (ms: number) => (ms < 60_000 ? '<1m' : fmtElapsed(ms))
     const scale = e.surface === 'terminal' ? 1 : DESKTOP_TEXT_SCALE
+    // Whether a line this many cells wide fits; a desktop's proportional text takes fewer than its length.
+    const fits = (width: number) => width * scale <= e.props.bodyColumns
 
-    const branchPart = onBranch ? (
-      <Text color={onBranch === mainBranch ? 'green' : 'yellow'} bold={onBranch !== mainBranch}>
-        ⎇ {onBranch}
-      </Text>
-    ) : null
-
-    // Worktrees and background tasks, squeezed one step at a time until they fit on the line: the full list;
-    // subagent worktrees by their hash; tasks as a count; subagent worktrees as a count; names cut to 12;
-    // the first names and a count of the rest; and last a count alone.
-    const own = trees.filter(w => !w.agent)
-    const byAgents = trees.filter(w => w.agent)
-    const wtItems = (shorten: boolean, group: boolean, max: number): MidItem[] => {
-      const named = (w: Worktree): MidItem => ({
-        key: w.path,
-        text: truncate(shorten && w.agent ? agentName(w.name) : w.name, max),
-        color: w.name === mainBranch ? 'green' : 'cyan',
-      })
-      return group && byAgents.length > 1
-        ? [...own.map(named), { key: 'agents', text: `agent ×${byAgents.length}`, color: 'cyan', count: byAgents.length }]
-        : [...own, ...byAgents].map(named)
-    }
-    const bgFull: MidItem[] = bg.map(b => ({ key: b.id, text: b.label, color: 'magenta', note: age(b.startedAt) }))
-    const bgCount: MidItem[] =
-      bg.length === 0 ? [] : [{ key: 'bg', text: `×${bg.length}`, color: 'magenta', note: age(Math.min(...bg.map(b => b.startedAt))) }]
-    const tight = wtItems(true, true, 12)
-    const layouts: [MidItem[], MidItem[]][] = [
-      [wtItems(false, false, 24), bgFull],
-      [wtItems(true, false, 24), bgFull],
-      [wtItems(true, false, 24), bgCount],
-      [wtItems(true, true, 24), bgCount],
-      [tight, bgCount],
-    ]
-    for (let k = tight.length - 1; k >= 1; k--) {
-      const hidden = tight.slice(k).reduce((n, x) => n + (x.count ?? 1), 0)
-      layouts.push([[...tight.slice(0, k), { key: 'more', text: `+${hidden}`, color: 'cyan' }], bgCount])
-    }
-    if (trees.length > 0) layouts.push([[{ key: 'count', text: `×${trees.length}`, color: 'cyan' }], bgCount])
-    // Outside a git repository there are no worktrees to speak of, so `wt` is left out rather than shown as none.
-    const inRepo = onBranch !== null
-    // When not even a count fits, the middle is left empty rather than pushing the line past the edge.
-    const fitting = layouts.find(([w, b]) => middleWidth(inRepo ? w : null, b) * scale <= room)
-
-    const section = (label: string, items: MidItem[]) => (
-      <Box flexWrap="nowrap" columnGap={1}>
-        <Text bold>{label}</Text>
-        {items.length === 0 ? (
-          <Text dimColor>none</Text>
-        ) : (
-          items.flatMap((x, i) => {
-            const row = (
-              <Box key={x.key} columnGap={1}>
-                <Text color={x.color}>{x.text}</Text>
-                {x.note ? <Text dimColor>{x.note}</Text> : null}
-              </Box>
-            )
-            return i === 0 ? [row] : [sep, row]
-          })
-        )}
-      </Box>
-    )
-
-    const timePart = elapsed ? (
-      <Box columnGap={1}>
-        <Text bold>time</Text>
-        <Text>{elapsed}</Text>
-      </Box>
-    ) : null
-
-    // Branch on the left, worktrees and background tasks in the middle (each `none` when empty), session
-    // time on the right.
-    const middleParts = !fitting
-      ? []
-      : inRepo
-        ? [section('wt', fitting[0]), section('bg', fitting[1])]
-        : [section('bg', fitting[1])]
+    // Row 2: the branch on the left, the session time on the right.
+    const elapsed = started !== null ? fmtElapsed(t - started) : null
     const statusLine =
-      branchPart || timePart || middleParts.length > 0 ? (
-        <Box width="100%" flexWrap="nowrap" columnGap={1}>
-          <Box width={sideWidth} flexShrink={0}>
-            {branchPart}
+      onBranch || elapsed ? (
+        <Box width="100%" flexWrap="nowrap" justifyContent="space-between" columnGap={1}>
+          {onBranch ? (
+            <Text color={onBranch === mainBranch ? 'green' : 'yellow'} bold={onBranch !== mainBranch}>
+              ⎇ {onBranch}
+            </Text>
+          ) : (
+            <Box />
+          )}
+          {elapsed ? (
+            <Box columnGap={1}>
+              <Text bold>time</Text>
+              <Text>{elapsed}</Text>
+            </Box>
+          ) : null}
+        </Box>
+      ) : null
+
+    // The list rows (wt, ag, bg, pr) are drawn only when they have something. Each is a label and its entries,
+    // squeezed one step at a time until the row fits, and left out when even the last step doesn't.
+    type Part = { text: string; color?: string; dim?: boolean; press?: () => void }
+    type Piece = { key: string; parts: Part[] }
+    const pieceWidth = (p: Piece) => p.parts.reduce((w, x, i) => w + (i > 0 ? 1 : 0) + cells(x.text), 0)
+    // The label, then each entry with the column before it, and each │ with the column after it.
+    const piecesWidth = (label: string, pieces: Piece[]) =>
+      cells(label) + pieces.reduce((w, p) => w + 1 + pieceWidth(p), 0) + 2 * Math.max(0, pieces.length - 1)
+    const drawPieces = (pieces: Piece[]) =>
+      pieces.flatMap((p, i) => {
+        const piece = (
+          <Box key={p.key} flexWrap="nowrap" columnGap={1}>
+            {p.parts.map((x, j) =>
+              x.press ? (
+                <Button key={`${p.key}:${j}`} label={x.text} plain dimColor={x.dim} onPress={x.press} />
+              ) : (
+                <Text key={`${p.key}:${j}`} color={x.color} dimColor={x.dim}>
+                  {x.text}
+                </Text>
+              ),
+            )}
           </Box>
-          {/* Spread evenly: the gaps take the spare room and shrink to one column as the lists grow. */}
-          <Box flexGrow={1} justifyContent="space-evenly" columnGap={1}>
-            {middleParts.flatMap((p, i) => (i === 0 ? [p] : [sep, p]))}
-          </Box>
-          <Box width={sideWidth} flexShrink={0} justifyContent="flex-end">
-            {timePart}
-          </Box>
+        )
+        return i === 0 ? [piece] : [sep, piece]
+      })
+    // The first layout that fits beside `extra` cells of something else on the row.
+    const listPart = (label: string, layouts: Piece[][], extra = 0) => {
+      const fit = layouts.find(ps => fits(piecesWidth(label, ps) + extra))
+      return fit ? (
+        <Box flexWrap="nowrap" columnGap={1}>
+          <Text bold>{label}</Text>
+          {drawPieces(fit)}
+        </Box>
+      ) : null
+    }
+    // The first k entries and a piece standing for the rest, k from all but one down to one.
+    const firstAndRest = (pieces: Piece[], rest: (hidden: Piece[]) => Piece) =>
+      Array.from({ length: Math.max(0, pieces.length - 1) }, (_, i) => {
+        const k = pieces.length - 1 - i
+        return [...pieces.slice(0, k), rest(pieces.slice(k))]
+      })
+    const countPiece = (n: number, color: string | undefined, ...more: Part[]): Piece => ({
+      key: 'count',
+      parts: [{ text: `×${n}`, color }, ...more],
+    })
+    const fullLine = (part: RenderChildren | null) =>
+      part ? (
+        <Box width="100%" flexWrap="nowrap">
+          {part}
+        </Box>
+      ) : null
+
+    // wt: the worktrees made by hand. Subagents' worktrees are left out: their agents are on the ag row.
+    const ownTrees = trees.filter(w => !w.agent)
+    const treePiece = (w: Worktree, max: number): Piece => ({
+      key: w.path,
+      parts: [{ text: truncate(w.name, max), color: w.name === mainBranch ? 'green' : 'cyan' }],
+    })
+    const wtLine =
+      ownTrees.length === 0
+        ? null
+        : fullLine(
+            listPart('wt', [
+              ownTrees.map(w => treePiece(w, 24)),
+              ownTrees.map(w => treePiece(w, 12)),
+              ...firstAndRest(
+                ownTrees.map(w => treePiece(w, 12)),
+                hidden => ({ key: 'more', parts: [{ text: `+${hidden.length}`, color: 'cyan' }] }),
+              ),
+              [countPiece(ownTrees.length, 'cyan')],
+            ]),
+          )
+
+    // ag: the subagents, and the background runs of another provider's agent (ChatGPT Sol through Codex), each
+    // with its description, model and effort, a mark for where it stands, and how long it has run.
+    type Act = { key: string; label: string; model?: string; status: keyof typeof AGENT_MARKS; ms: number }
+    const acts: Act[] = [
+      ...subagents.map(a => ({
+        key: a.id,
+        label: a.description,
+        model: a.model,
+        status: a.status,
+        ms: (a.endedAt ?? t) - a.firstSeen,
+      })),
+      ...bg.filter(b => b.model).map(b => ({ key: b.id, label: b.label, model: b.model, status: 'running' as const, ms: t - b.startedAt })),
+    ]
+    const markPart = (status: keyof typeof AGENT_MARKS): Part => ({
+      text: AGENT_MARKS[status].mark,
+      color: AGENT_MARKS[status].color,
+      dim: AGENT_MARKS[status].color === undefined,
+    })
+    const worstOf = (list: Act[]) =>
+      list.reduce<keyof typeof AGENT_MARKS>((w, a) => (AGENT_MARKS[a.status].rank > AGENT_MARKS[w].rank ? a.status : w), 'completed')
+    const actPiece = (a: Act, max: number | null): Piece => ({
+      key: a.key,
+      parts: [
+        ...(max === null ? [] : [{ text: truncate(a.label, max) }]),
+        ...(a.model ? [{ text: a.model, color: 'blue' }] : []),
+        markPart(a.status),
+        { text: span(a.ms), dim: true },
+      ],
+    })
+    // Grouped by model when the entries no longer fit: `Opus High ×2 ●`.
+    const byModel = new Map<string, Act[]>()
+    for (const a of acts) byModel.set(a.model ?? 'agent', [...(byModel.get(a.model ?? 'agent') ?? []), a])
+    const agLine =
+      acts.length === 0
+        ? null
+        : fullLine(
+            listPart('ag', [
+              acts.map(a => actPiece(a, 24)),
+              acts.map(a => actPiece(a, 12)),
+              acts.map(a => actPiece(a, null)),
+              [...byModel].map(([model, list]) => ({
+                key: `m:${model}`,
+                parts: [{ text: `${model} ×${list.length}`, color: 'blue' }, markPart(worstOf(list))],
+              })),
+              [countPiece(acts.length, undefined, markPart(worstOf(acts)))],
+            ]),
+          )
+
+    // bg: background shells and monitors, by the description their call gave, with how long each has run.
+    const plain = bg.filter(b => !b.model)
+    const taskPiece = (b: BgTask, max: number): Piece => ({
+      key: b.id,
+      parts: [
+        { text: truncate(b.label, max), color: 'magenta' },
+        { text: span(t - b.startedAt), dim: true },
+      ],
+    })
+    const bgLine =
+      plain.length === 0
+        ? null
+        : fullLine(
+            listPart('bg', [
+              plain.map(b => taskPiece(b, 32)),
+              plain.map(b => taskPiece(b, 16)),
+              ...firstAndRest(
+                plain.map(b => taskPiece(b, 16)),
+                hidden => ({ key: 'more', parts: [{ text: `+${hidden.length}`, color: 'magenta' }] }),
+              ),
+              [countPiece(plain.length, 'magenta', { text: span(t - Math.min(...plain.map(b => b.startedAt))), dim: true })],
+            ]),
+          )
+
+    // pr and diff: the open PRs, each with its checks passed out of the total, and the branch's diff against the
+    // main branch. Drawn only when there's a PR or a diff; then a half with nothing to show is left out, except
+    // that a gh that can't answer still says so.
+    const prList = prState?.kind === 'ok' ? prState.prs : []
+    const stale = prState?.kind === 'ok' && prState.stale
+    const diffShown = diffState?.kind === 'ok' && !diffState.clean
+    const prLabel = (p: Pr, max: number | null) => (max === null || p.title === '' ? `#${p.number}` : `#${p.number} ${truncate(p.title, max)}`)
+    const checksPart = (state: Checks['state'], text: string): Part => ({
+      text,
+      color: stale ? undefined : CHECK_MARKS[state].color,
+      dim: stale || state === 'unknown',
+    })
+    const prPiece = (p: Pr, max: number | null): Piece => ({
+      key: `pr:${p.number}`,
+      parts: [
+        { text: prLabel(p, max), dim: p.draft || stale, press: () => openUrl($, p.url) },
+        ...(p.checks ? [checksPart(p.checks.state, `${CHECK_MARKS[p.checks.state].mark} ${p.checks.passed}/${p.checks.total}`)] : []),
+      ],
+    })
+    const worstCheck = prList.reduce<Checks['state'] | null>(
+      (w, p) => (p.checks && (w === null || CHECK_MARKS[p.checks.state].rank > CHECK_MARKS[w].rank) ? p.checks.state : w),
+      null,
+    )
+    const diffNumbers = diffState?.kind === 'ok' ? [`+${diffState.added}`, `−${diffState.deleted}`] : []
+    const diffWidth = diffShown ? 5 + cells(mainBranch) + diffNumbers.reduce((w, x) => w + 1 + cells(x), 0) : 0
+    const diffPart = diffShown ? (
+      <Box flexWrap="nowrap" columnGap={1}>
+        <Text bold>diff</Text>
+        <Text dimColor>{mainBranch}</Text>
+        <Text color="green">{diffNumbers[0]}</Text>
+        <Text color="red">{diffNumbers[1]}</Text>
+      </Box>
+    ) : null
+    const extra = diffShown ? diffWidth + 1 : 0
+    const prPart =
+      prList.length > 0
+        ? listPart(
+            'pr',
+            [
+              prList.map(p => prPiece(p, 32)),
+              prList.map(p => prPiece(p, 16)),
+              prList.map(p => prPiece(p, null)),
+              [countPiece(prList.length, undefined, ...(worstCheck ? [checksPart(worstCheck, CHECK_MARKS[worstCheck].mark)] : []))],
+            ],
+            extra,
+          )
+        : prState?.kind === 'unavailable' && diffShown
+          ? listPart('pr', [[{ key: 'na', parts: [{ text: 'unavailable', dim: true }] }]], extra)
+          : null
+    const workLine =
+      workOn && (prPart || diffShown) && fits(diffWidth) ? (
+        <Box width="100%" flexWrap="nowrap" justifyContent="space-between" columnGap={1}>
+          {prPart ?? <Box />}
+          {diffPart}
         </Box>
       ) : null
 
@@ -1115,89 +1346,24 @@ export const register: Register = (on, options) => {
         </Box>
       ) : null
 
-    // The work row: the open PRs on the left, each with its checks passed out of the total, and the branch's
-    // diff against the main branch on the right. Squeezed one step at a time until the whole row fits: titles
-    // cut to 32, then to 16, then numbers alone, then a count with the worst mark; failing that, left empty.
-    const len = cells
-    const prLabel = (p: Pr, max: number | null) => (max === null || p.title === '' ? `#${p.number}` : `#${p.number} ${truncate(p.title, max)}`)
-    const checksLabel = (c: Checks) => `${CHECK_MARKS[c.state].mark} ${c.passed}/${c.total}`
-    const prWidth = (p: Pr, max: number | null) => len(prLabel(p, max)) + (p.checks ? 1 + len(checksLabel(p.checks)) : 0)
-    const listed = prState?.kind === 'ok' ? prState.prs : []
-    const stale = prState?.kind === 'ok' && prState.stale
-    const worstState = listed.reduce<Checks['state'] | null>(
-      (w, p) => (p.checks && (w === null || CHECK_MARKS[p.checks.state].rank > CHECK_MARKS[w].rank) ? p.checks.state : w),
-      null,
-    )
-    const quiet = (text: string) => <Text dimColor>{text}</Text>
-    const prSection = (body: RenderChildren[]) => (
-      <Box flexWrap="nowrap" columnGap={1}>
-        <Text bold>pr</Text>
-        {body}
-      </Box>
-    )
-    const markText = (state: Checks['state'], text: string) => (
-      <Text color={stale ? undefined : CHECK_MARKS[state].color} dimColor={stale || state === 'unknown'}>
-        {text}
-      </Text>
-    )
-    // Each form: its width in cells and what it draws.
-    const prForms: [number, RenderChildren][] = []
-    if (prState?.kind === 'loading') prForms.push([4, prSection([quiet('…')])])
-    else if (prState?.kind === 'unavailable') prForms.push([14, prSection([quiet('unavailable')])])
-    else if (prState?.kind === 'ok' && listed.length === 0) prForms.push([7, prSection([quiet('none')])])
-    else if (prState?.kind === 'ok') {
-      for (const max of [32, 16, null]) {
-        const width = 2 + listed.reduce((w, p) => w + 1 + prWidth(p, max), 0) + 2 * (listed.length - 1)
-        const items = listed.map(p => (
-          <Box key={`pr:${p.number}`} flexWrap="nowrap" columnGap={1}>
-            <Button key={`p:${p.number}`} label={prLabel(p, max)} plain dimColor={p.draft || stale} onPress={() => openUrl($, p.url)} />
-            {p.checks ? markText(p.checks.state, checksLabel(p.checks)) : null}
-          </Box>
-        ))
-        prForms.push([width, prSection(items.flatMap((x, i) => (i === 0 ? [x] : [sep, x])))])
-      }
-      const count = `×${listed.length}`
-      const mark = worstState ? CHECK_MARKS[worstState].mark : ''
-      prForms.push([3 + len(count) + (mark ? 1 + len(mark) : 0), prSection([<Text key="n">{count}</Text>, worstState ? markText(worstState, mark) : null])])
-    }
-
-    const diffText: string[] =
-      diffState?.kind === 'ok' ? (diffState.clean ? ['clean'] : [`+${diffState.added}`, `−${diffState.deleted}`]) : ['unavailable']
-    const diffWidth = diffState === null ? 0 : 5 + len(mainBranch) + diffText.reduce((w, x) => w + 1 + len(x), 0)
-    const diffPart =
-      diffState === null ? null : (
-        <Box flexWrap="nowrap" columnGap={1}>
-          <Text bold>diff</Text>
-          <Text dimColor>{mainBranch}</Text>
-          {diffState.kind === 'ok' && !diffState.clean ? (
-            <Box columnGap={1}>
-              <Text color="green">{diffText[0]}</Text>
-              <Text color="red">{diffText[1]}</Text>
-            </Box>
-          ) : (
-            quiet(diffText.join(' '))
-          )}
-        </Box>
-      )
-    const workFits = (w: number) => w * scale <= e.props.bodyColumns
-    const prPart = prForms.length === 0 ? null : prForms.find(([w]) => workFits(w + (diffPart ? diffWidth + 1 : 0)))?.[1]
-    const workLine =
-      !workOn || (prForms.length === 0 && diffPart === null) || (prForms.length > 0 && !prPart) || !workFits(diffWidth) ? null : (
-        <Box width="100%" flexWrap="nowrap" justifyContent="space-between" columnGap={1}>
-          {prPart ?? <Box />}
-          {diffPart}
-        </Box>
-      )
-
-    if (!awayLine && !statusLine && !workLine && !recentLine) {
+    if (!awayLine && !statusLine && !wtLine && !agLine && !bgLine && !workLine && !recentLine) {
       return firstLine
     }
 
+    // A blank line between rows while they all fit in the rows the band may take; packed tight when they don't,
+    // so the list rows stay in view instead of scrolling behind the band's `n more`. The recent-sessions cells
+    // take three rows each.
+    const lines = [awayLine, statusLine, wtLine, agLine, bgLine, workLine].filter(Boolean).length + 1 + (recentLine ? 3 : 0)
+    const spacing = 2 * lines - 1 <= e.props.maxRows ? 1 : 0
+
     return (
-      <Box width="100%" flexDirection="column" rowGap={1}>
+      <Box width="100%" flexDirection="column" rowGap={spacing}>
         {firstLine}
         {awayLine}
         {statusLine}
+        {wtLine}
+        {agLine}
+        {bgLine}
         {workLine}
         {recentLine}
       </Box>
