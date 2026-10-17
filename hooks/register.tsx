@@ -135,7 +135,8 @@ const modelLabel = (model: string | undefined, effort: string | undefined) =>
 // -m/--model and its effort from model_reasoning_effort, as 'Sol High'; undefined for any other command. Each
 // part of a compound command is looked at on its own, so `git commit -m x && codex exec ...` reads codex's -m.
 // A command line split into the commands it runs, each as its words, the shell's way as far as this needs:
-// quotes keep a word together and are removed, a backslash keeps the next character, and ; & && || | and
+// quotes keep a word together and are removed, a backslash keeps the next character (inside double quotes, the
+// characters the shell lets it), and ; & && || | and
 // newlines outside quotes end a command (but not the & of a redirection such as 2>&1).
 const shellCommands = (line: string): string[][] => {
   const commands: string[][] = []
@@ -155,6 +156,8 @@ const shellCommands = (line: string): string[][] => {
     const ch = line.charAt(i)
     if (quote !== null) {
       if (ch === quote) quote = null
+      // Inside double quotes a backslash keeps a quote, a backslash, a $ or a backtick as itself.
+      else if (quote === '"' && ch === '\\' && /["\\$`]/.test(line.charAt(i + 1))) word = (word ?? '') + line.charAt(++i)
       else word = (word ?? '') + ch
     } else if (ch === "'" || ch === '"') {
       quote = ch
@@ -186,7 +189,7 @@ const codexModel = (command: string) => {
     if (program !== 'codex-locked' && !(program === 'codex' && args.includes('exec'))) continue
     const flag = args.findIndex(w => w === '-m' || w === '--model')
     const model = (flag >= 0 ? args[flag + 1] : args.find(w => w.startsWith('--model='))?.slice(8)) || 'codex'
-    const effort = args.map(w => /^model_reasoning_effort=['"]*([a-z]+)/.exec(w)?.[1]).find(Boolean)
+    const effort = args.map(w => /^model_reasoning_effort\s*=\s*['"]*([a-z]+)/.exec(w)?.[1]).find(Boolean)
     return modelLabel(model, effort)
   }
   return undefined
@@ -259,7 +262,9 @@ async function scanAgents($: EngineInterface) {
     // Kept while the engine lists it, so an expired one isn't taken for new; hidden once expired.
     if (!ids.has(id) && expired(seen)) {
       agentSeen.delete(id)
-      agentNotes.delete(id)
+      // Notes taken after it finished belong to it resumed, and stay for its next listing.
+      const noted = agentNotes.get(id)
+      if (noted && noted.at <= (seen.endedAt ?? 0)) agentNotes.delete(id)
     }
   }
   // Notes for an agent never listed (it came and went between polls) go once they're stale.
@@ -279,6 +284,9 @@ async function scanAgents($: EngineInterface) {
 function noteAgentStep($: EngineInterface, id: string, model: string, effort: string | undefined) {
   const noted = agentNotes.get(id)
   agentNotes.set(id, { model, effort, at: Date.now() })
+  // A step means it's running: a finished one has been resumed.
+  const seen = agentSeen.get(id)
+  if (seen) seen.endedAt = undefined
   if (!agentSeen.has(id) || noted?.model !== model || noted.effort !== effort) void refreshAgents($)
 }
 
