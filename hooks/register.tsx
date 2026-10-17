@@ -1363,7 +1363,7 @@ export const register: Register = (on, options) => {
     // column either side of the middle, and the wt part.
     const leftWidth = (diff: boolean): Width => ({
       text: cells(branchText) + (diff ? diffNumbers.reduce((w, x) => w + cells(x), 0) : 0),
-      gaps: diff ? 3 : 0,
+      gaps: diff ? 1 + (onBranch ? 2 : 0) : 0,
     })
     const rightWidth: Width = { text: elapsed ? 4 + cells(elapsed) : 0, gaps: elapsed ? 1 : 0 }
     const columns = (w: Width) => Math.ceil(w.text * scale) + w.gaps
