@@ -17,19 +17,23 @@ Usage and Status Banner Plugin for Claude
   - `week`: weekly usage, the same way
   - `ctx`: context used out of the window, as tokens and a percentage
   - `cache`: the prompt-cache countdown, yellow in the last five minutes and red in the last minute
-- **Row 2: status**: the git branch, green on the main branch and yellow on any other, with its diff beside it,
-  and on the right `time`, how long the session has been running. The diff is the lines added and deleted since
-  the branch left the expected branch (`mainBranch`), uncommitted work and new files included (the lines of the
-  first 200 new files), as `+152 −32`, and isn't shown when there's nothing. It compares with the merge-base of
-  `HEAD` and `origin/<mainBranch>` (the local `<mainBranch>` when there's no such remote branch), as the refs
-  stand locally: nothing is fetched. On a row too narrow for it, it's left out
+- **Row 2: status**, left to right
+  - Left: the git branch, green on the main branch and yellow on any other, with its diff beside it: the lines
+    added and deleted since the branch left the expected branch (`mainBranch`), uncommitted work and new files
+    included (the lines of the first 200 new files), as `+152 −32`, and not shown when there's nothing. It
+    compares with the merge-base of `HEAD` and `origin/<mainBranch>` (the local `<mainBranch>` when there's no
+    such remote branch), as the refs stand locally: nothing is fetched
+  - Middle: `wt`, the repository's other worktrees that you made, each by its branch (by its folder when
+    detached), shown only when there are some. Subagents' worktrees (`.claude/worktrees/agent-…`) are left out:
+    their agents are on `ag`
+  - Right: `time`, how long the session has been running
+  - When the row runs out of room, the worktrees are squeezed a step at a time (full names first, then cut to
+    24, then 12, then the first names and `+N`, then `×N`), then left out, then the diff is left out
 - **The list rows** below it each appear only while they have something to show, so a quiet session is two
   rows tall. Rows have a blank line between them while they all fit in the space the app gives the banner
   (at most half the terminal); when they wouldn't, they're packed tight. Each is a label and its entries; when a row runs out of room it is squeezed a step at a time, as
   each row's entry says (full titles first), and on a row too narrow even for its last step the row is left
-  out.
-  - `wt`: the repository's other worktrees that you made, each by its branch (by its folder when detached). Subagents' worktrees (`.claude/worktrees/agent-…`) are left out: their agents are on
-    `ag`. Squeezed: names cut to 24, then 12, then the first names and `+N`, then `×N`
+  out. A squeezed row is spread across the full width; one with room to spare stays to the left.
   - `ag`: this session's subagents, from Claude Code's own agent list, each with its description, its model and
     effort (`Opus High`, `Sonnet Med`, from its first step), a mark (`●` running, `○` waiting or idle, `✓` done, `✗` failed) and how long it has run. A finished
     one stays for two minutes. Background runs of ChatGPT through the Codex CLI (`codex-locked`, `codex exec`)

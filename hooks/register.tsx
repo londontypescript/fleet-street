@@ -674,6 +674,9 @@ const CHECK_FAILED = new Set(['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUI
 const CHECK_PASSED = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED'])
 // How each result is drawn, and which wins when a count stands for several PRs.
 // How a subagent's status is drawn, and which wins when one mark stands for several.
+// The colour of an agent's model and effort on the ag row.
+const MODEL_COLOR = '#f28c28'
+
 const AGENT_MARKS: Record<Subagent['status'], { mark: string; color: string | undefined; rank: number }> = {
   failed: { mark: '✗', color: 'red', rank: 4 },
   killed: { mark: '✗', color: 'red', rank: 4 },
@@ -1189,7 +1192,7 @@ export const register: Register = (on, options) => {
     type Width = { text: number; gaps: number }
     const fits = (w: Width) => w.text * scale + w.gaps <= e.props.bodyColumns
 
-    // The list rows (wt, ag, bg, pr) are drawn only when they have something. Each is a label and its entries,
+    // The list rows (ag, bg, pr) are drawn only when they have something. Each is a label and its entries,
     // squeezed one step at a time until the row fits, and left out when even the last step doesn't.
     type Part = { text: string; color?: string; dim?: boolean; press?: () => void }
     type Piece = { key: string; parts: Part[] }
@@ -1216,15 +1219,22 @@ export const register: Register = (on, options) => {
         )
         return i === 0 ? [piece] : [sep, piece]
       })
-    // The first layout that fits.
+    // The first layout that fits. A squeezed row is nearly full, so its entries are spread across the width to
+    // even out what's left; one with room to spare stays to the left. The label stays with the first entry.
     const listPart = (label: string, layouts: Piece[][]) => {
       const fit = layouts.find(ps => fits(piecesWidth(label, ps)))
-      return fit ? (
-        <Box flexWrap="nowrap" columnGap={1}>
-          <Text bold>{label}</Text>
-          {drawPieces(fit)}
+      if (!fit) return null
+      const squeezed = fit !== layouts[0]
+      const [first, ...rest] = drawPieces(fit)
+      return (
+        <Box width={squeezed ? '100%' : undefined} flexWrap="nowrap" justifyContent={squeezed ? 'space-between' : undefined} columnGap={1}>
+          <Box flexWrap="nowrap" columnGap={1}>
+            <Text bold>{label}</Text>
+            {first}
+          </Box>
+          {rest}
         </Box>
-      ) : null
+      )
     }
     // The first k entries and a piece standing for the rest, k from all but one down to one.
     const firstAndRest = (pieces: Piece[], rest: (hidden: Piece[]) => Piece) =>
@@ -1243,27 +1253,26 @@ export const register: Register = (on, options) => {
         </Box>
       ) : null
 
-    // wt: the worktrees made by hand. Subagents' worktrees are left out: their agents are on the ag row.
+    // wt: the worktrees made by hand, in the middle of row 2. Subagents' worktrees are left out: their agents
+    // are on the ag row.
     const ownTrees = trees.filter(w => !w.agent)
     const treePiece = (w: Worktree, max: number): Piece => ({
       key: w.path,
       parts: [{ text: truncate(w.name, max), color: w.name === mainBranch ? 'green' : 'cyan' }],
     })
-    const wtLine =
+    const wtLayouts: Piece[][] =
       ownTrees.length === 0
-        ? null
-        : fullLine(
-            listPart('wt', [
-              ownTrees.map(w => treePiece(w, Infinity)),
-              ownTrees.map(w => treePiece(w, 24)),
+        ? []
+        : [
+            ownTrees.map(w => treePiece(w, Infinity)),
+            ownTrees.map(w => treePiece(w, 24)),
+            ownTrees.map(w => treePiece(w, 12)),
+            ...firstAndRest(
               ownTrees.map(w => treePiece(w, 12)),
-              ...firstAndRest(
-                ownTrees.map(w => treePiece(w, 12)),
-                hidden => ({ key: 'more', parts: [{ text: `+${hidden.length}`, color: 'cyan' }] }),
-              ),
-              [countPiece(ownTrees.length, 'cyan')],
-            ]),
-          )
+              hidden => ({ key: 'more', parts: [{ text: `+${hidden.length}`, color: 'cyan' }] }),
+            ),
+            [countPiece(ownTrees.length, 'cyan')],
+          ]
 
     // ag: the subagents, and the background runs of another provider's agent (ChatGPT Sol through Codex), each
     // with its description, model and effort, a mark for where it stands, and how long it has run.
@@ -1289,7 +1298,7 @@ export const register: Register = (on, options) => {
       key: a.key,
       parts: [
         ...(max === null ? [] : [{ text: truncate(a.label, max) }]),
-        ...(a.model ? [{ text: a.model, color: 'blue' }] : []),
+        ...(a.model ? [{ text: a.model, color: MODEL_COLOR }] : []),
         markPart(a.status),
         { text: span(a.ms), dim: true },
       ],
@@ -1308,7 +1317,7 @@ export const register: Register = (on, options) => {
               acts.map(a => actPiece(a, null)),
               [...byModel].map(([model, list]) => ({
                 key: `m:${model}`,
-                parts: [{ text: `${model} ×${list.length}`, color: 'blue' }, markPart(worstOf(list))],
+                parts: [{ text: `${model} ×${list.length}`, color: MODEL_COLOR }, markPart(worstOf(list))],
               })),
               [countPiece(acts.length, undefined, markPart(worstOf(acts)))],
             ]),
@@ -1340,25 +1349,40 @@ export const register: Register = (on, options) => {
           )
 
     // Row 2: the branch with its diff against the main branch beside it (`+152 −32`, uncommitted work included),
-    // and the session time on the right. The diff is left out when the row has no room for it.
+    // the worktrees in the middle, and the session time on the right. When the row runs out of room the
+    // worktrees are squeezed a step at a time, then left out, then the diff is left out.
     const elapsed = started !== null ? fmtElapsed(t - started) : null
     const diffShown = workOn && diffState?.kind === 'ok' && !diffState.clean
     const diffNumbers = diffState?.kind === 'ok' ? [`+${diffState.added}`, `−${diffState.deleted}`] : []
     const branchText = onBranch ? `⎇ ${onBranch}` : ''
-    // The branch, two columns, the two numbers a column apart; at least a column, then `time 26m`.
-    const row2: Width = {
-      text: cells(branchText) + diffNumbers.reduce((w, x) => w + cells(x), 0) + (elapsed ? 4 + cells(elapsed) : 0),
-      gaps: 2 + 1 + (elapsed ? 2 : 0),
+    // The branch; with the diff, two columns and the two numbers a column apart; with worktrees, a column and
+    // the wt part; with the time, a column and `time 26m`.
+    const row2Width = (diff: boolean, wt: Piece[] | null): Width => {
+      const wtWidth = wt ? piecesWidth('wt', wt) : { text: 0, gaps: 0 }
+      return {
+        text: cells(branchText) + (diff ? diffNumbers.reduce((w, x) => w + cells(x), 0) : 0) + wtWidth.text + (elapsed ? 4 + cells(elapsed) : 0),
+        gaps: (diff ? 3 : 0) + (wt ? 1 + wtWidth.gaps : 0) + (elapsed ? 2 : 0),
+      }
     }
-    const diffPart =
-      diffShown && fits(row2) ? (
-        <Box flexWrap="nowrap" columnGap={1}>
-          <Text color="green">{diffNumbers[0]}</Text>
-          <Text color="red">{diffNumbers[1]}</Text>
-        </Box>
-      ) : null
+    const row2Fit = [
+      ...wtLayouts.map(wt => ({ diff: diffShown, wt })),
+      { diff: diffShown, wt: null },
+      { diff: false, wt: null },
+    ].find(c => fits(row2Width(c.diff, c.wt))) ?? { diff: false, wt: null }
+    const diffPart = row2Fit.diff ? (
+      <Box flexWrap="nowrap" columnGap={1}>
+        <Text color="green">{diffNumbers[0]}</Text>
+        <Text color="red">{diffNumbers[1]}</Text>
+      </Box>
+    ) : null
+    const wtPart = row2Fit.wt ? (
+      <Box flexWrap="nowrap" columnGap={1}>
+        <Text bold>wt</Text>
+        {drawPieces(row2Fit.wt)}
+      </Box>
+    ) : null
     const statusLine =
-      onBranch || elapsed ? (
+      onBranch || elapsed || wtPart ? (
         <Box width="100%" flexWrap="nowrap" justifyContent="space-between" columnGap={1}>
           <Box flexWrap="nowrap" columnGap={2}>
             {onBranch ? (
@@ -1368,6 +1392,7 @@ export const register: Register = (on, options) => {
             ) : null}
             {diffPart}
           </Box>
+          {wtPart}
           {elapsed ? (
             <Box columnGap={1}>
               <Text bold>time</Text>
@@ -1445,14 +1470,14 @@ export const register: Register = (on, options) => {
         </Box>
       ) : null
 
-    if (!awayLine && !statusLine && !wtLine && !agLine && !bgLine && !prLine && !recentLine) {
+    if (!awayLine && !statusLine && !agLine && !bgLine && !prLine && !recentLine) {
       return firstLine
     }
 
     // A blank line between rows while they all fit in the rows the band may take; packed tight when they don't,
     // so the list rows stay in view instead of scrolling behind the band's `n more`. Each row is one line but
     // the recent-sessions cells, which take three; the blank lines go between rows.
-    const shown = [awayLine, statusLine, wtLine, agLine, bgLine, prLine, recentLine].filter(Boolean).length + 1
+    const shown = [awayLine, statusLine, agLine, bgLine, prLine, recentLine].filter(Boolean).length + 1
     const height = shown + (recentLine && sessions !== null && sessions.length > 0 ? 2 : 0)
     const spacing = height + shown - 1 <= e.props.maxRows ? 1 : 0
 
@@ -1461,7 +1486,6 @@ export const register: Register = (on, options) => {
         {firstLine}
         {awayLine}
         {statusLine}
-        {wtLine}
         {agLine}
         {bgLine}
         {prLine}
