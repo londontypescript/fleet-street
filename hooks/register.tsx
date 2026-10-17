@@ -132,20 +132,28 @@ const modelLabel = (model: string | undefined, effort: string | undefined) =>
   model === undefined ? undefined : effort ? `${modelFamily(model)} ${EFFORT_SHORT[effort] ?? effort}` : modelFamily(model)
 
 // A run of another provider's agent through the Codex CLI (codex-locked, or codex exec): its model from
-// -m/--model and its effort from model_reasoning_effort, as 'Sol High'; undefined for any other command.
+// -m/--model and its effort from model_reasoning_effort, as 'Sol High'; undefined for any other command. Each
+// part of a compound command is looked at on its own, so `git commit -m x && codex exec ...` reads codex's -m.
 const codexModel = (command: string) => {
-  if (!/\bcodex-locked\b|\bcodex\s+(?:-\S+\s+)*exec\b/.test(command)) return undefined
-  const model = /(?:^|\s)(?:-m|--model)(?:\s+|=)['"]?([\w.-]+)/.exec(command)?.[1] ?? 'codex'
-  const effort = /model_reasoning_effort\s*=\s*['"]*([a-z]+)/.exec(command)?.[1]
-  return modelLabel(model, effort)
+  for (const segment of command.split(/&&|\|\||[;|\n]/)) {
+    const words = segment.trim().split(/\s+/).map(w => w.replace(/^['"]+|['"]+$/g, ''))
+    // The program the segment runs, past any VAR=value before it.
+    const program = words.find(w => !/^\w+=/.test(w))?.split('/').pop()
+    if (program !== 'codex-locked' && !(program === 'codex' && words.includes('exec'))) continue
+    const flag = words.findIndex(w => w === '-m' || w === '--model')
+    const model = (flag >= 0 ? words[flag + 1] : words.find(w => w.startsWith('--model='))?.slice(8)) || 'codex'
+    const effort = /model_reasoning_effort\s*=\s*['"]*([a-z]+)/.exec(segment)?.[1]
+    return modelLabel(model, effort)
+  }
+  return undefined
 }
 
 // What each subagent's steps and tool calls have shown of its model and effort, by agent id. Only read from
 // events as they pass: nothing hooks a subagent's start, which crashed the mod for subagents in worktrees.
 const agentModels = new Map<string, string>()
 const agentEfforts = new Map<string, string>()
-// When each agent was first seen, and first seen finished.
-const agentSeen = new Map<string, { firstSeen: number; endedAt?: number }>()
+// When each agent was first seen and first seen finished, and how it last looked.
+const agentSeen = new Map<string, { firstSeen: number; endedAt?: number; last?: Subagent }>()
 const FINISHED = new Set(['completed', 'failed', 'killed'])
 // A finished subagent stays on the row this long, so a quick one is still seen.
 const AGENT_DONE_MS = 2 * 60_000
@@ -161,32 +169,35 @@ async function refreshAgents($: EngineInterface) {
   try {
     const t = Date.now()
     const list = await $.agent.list()
-    const found: Subagent[] = []
     const ids = new Set<string>()
     for (const a of list) {
       ids.add(a.id)
-      let seen = agentSeen.get(a.id)
-      if (!seen) {
-        seen = { firstSeen: t }
-        agentSeen.set(a.id, seen)
-      }
-      if (FINISHED.has(a.status)) seen.endedAt ??= t
-      if (seen.endedAt !== undefined && t - seen.endedAt > AGENT_DONE_MS) continue
-      found.push({
+      const seen = agentSeen.get(a.id) ?? { firstSeen: t }
+      // A finished agent may be resumed under its id: it is running again, not finished.
+      seen.endedAt = FINISHED.has(a.status) ? (seen.endedAt ?? t) : undefined
+      seen.last = {
         id: a.id,
         description: (a.description || a.name || a.type).replace(/\s+/g, ' ').trim(),
         status: a.status,
         model: modelLabel(agentModels.get(a.id), agentEfforts.get(a.id)),
         firstSeen: seen.firstSeen,
         endedAt: seen.endedAt,
-      })
+      }
+      agentSeen.set(a.id, seen)
     }
-    for (const id of [...agentSeen.keys()]) {
-      if (ids.has(id)) continue
-      agentSeen.delete(id)
-      agentModels.delete(id)
-      agentEfforts.delete(id)
+    // One the engine has dropped stays as it was last seen, finished, for the rest of its two minutes.
+    for (const [id, seen] of agentSeen) {
+      if (!ids.has(id) && seen.last) {
+        seen.endedAt ??= t
+        seen.last = { ...seen.last, status: FINISHED.has(seen.last.status) ? seen.last.status : 'completed', endedAt: seen.endedAt }
+      }
+      if (seen.endedAt !== undefined && t - seen.endedAt > AGENT_DONE_MS) agentSeen.delete(id)
     }
+    // What steps and tool calls noted for agents no longer kept, including ones the list never showed.
+    for (const map of [agentModels, agentEfforts]) {
+      for (const id of [...map.keys()]) if (!agentSeen.has(id) && !ids.has(id)) map.delete(id)
+    }
+    const found = [...agentSeen.values()].flatMap(s => (s.last ? [s.last] : []))
     agentsFailed = false
     const key = JSON.stringify(found)
     if (key !== agentsShown) {
@@ -1085,8 +1096,10 @@ export const register: Register = (on, options) => {
     // Under a minute reads <1m, so the banner keeps its once-a-minute redraw.
     const span = (ms: number) => (ms < 60_000 ? '<1m' : fmtElapsed(ms))
     const scale = e.surface === 'terminal' ? 1 : DESKTOP_TEXT_SCALE
-    // Whether a line this many cells wide fits; a desktop's proportional text takes fewer than its length.
-    const fits = (width: number) => width * scale <= e.props.bodyColumns
+    // Whether a line of this much text and this many gap columns fits: a desktop's proportional text takes fewer
+    // cells than its length, but a Box's gaps are whole columns on every surface.
+    type Width = { text: number; gaps: number }
+    const fits = (w: Width) => w.text * scale + w.gaps <= e.props.bodyColumns
 
     // Row 2: the branch on the left, the session time on the right.
     const elapsed = started !== null ? fmtElapsed(t - started) : null
@@ -1113,10 +1126,12 @@ export const register: Register = (on, options) => {
     // squeezed one step at a time until the row fits, and left out when even the last step doesn't.
     type Part = { text: string; color?: string; dim?: boolean; press?: () => void }
     type Piece = { key: string; parts: Part[] }
-    const pieceWidth = (p: Piece) => p.parts.reduce((w, x, i) => w + (i > 0 ? 1 : 0) + cells(x.text), 0)
-    // The label, then each entry with the column before it, and each │ with the column after it.
-    const piecesWidth = (label: string, pieces: Piece[]) =>
-      cells(label) + pieces.reduce((w, p) => w + 1 + pieceWidth(p), 0) + 2 * Math.max(0, pieces.length - 1)
+    // The label, then each entry with the gap before it, its parts with a gap between each, and each │ with
+    // the gap after it.
+    const piecesWidth = (label: string, pieces: Piece[]): Width => ({
+      text: cells(label) + pieces.reduce((w, p) => w + p.parts.reduce((n, x) => n + cells(x.text), 0), 0) + Math.max(0, pieces.length - 1),
+      gaps: pieces.reduce((w, p) => w + 1 + p.parts.length - 1, 0) + Math.max(0, pieces.length - 1),
+    })
     const drawPieces = (pieces: Piece[]) =>
       pieces.flatMap((p, i) => {
         const piece = (
@@ -1134,9 +1149,12 @@ export const register: Register = (on, options) => {
         )
         return i === 0 ? [piece] : [sep, piece]
       })
-    // The first layout that fits beside `extra` cells of something else on the row.
-    const listPart = (label: string, layouts: Piece[][], extra = 0) => {
-      const fit = layouts.find(ps => fits(piecesWidth(label, ps) + extra))
+    // The first layout that fits beside `extra`, something else on the row.
+    const listPart = (label: string, layouts: Piece[][], extra: Width = { text: 0, gaps: 0 }) => {
+      const fit = layouts.find(ps => {
+        const w = piecesWidth(label, ps)
+        return fits({ text: w.text + extra.text, gaps: w.gaps + extra.gaps })
+      })
       return fit ? (
         <Box flexWrap="nowrap" columnGap={1}>
           <Text bold>{label}</Text>
@@ -1278,7 +1296,10 @@ export const register: Register = (on, options) => {
       null,
     )
     const diffNumbers = diffState?.kind === 'ok' ? [`+${diffState.added}`, `−${diffState.deleted}`] : []
-    const diffWidth = diffShown ? 5 + cells(mainBranch) + diffNumbers.reduce((w, x) => w + 1 + cells(x), 0) : 0
+    // `diff main +152 −32`: four texts with a gap after each of the first three.
+    const diffWidth: Width = diffShown
+      ? { text: 4 + cells(mainBranch) + diffNumbers.reduce((w, x) => w + cells(x), 0), gaps: 1 + diffNumbers.length }
+      : { text: 0, gaps: 0 }
     const diffPart = diffShown ? (
       <Box flexWrap="nowrap" columnGap={1}>
         <Text bold>diff</Text>
@@ -1287,7 +1308,8 @@ export const register: Register = (on, options) => {
         <Text color="red">{diffNumbers[1]}</Text>
       </Box>
     ) : null
-    const extra = diffShown ? diffWidth + 1 : 0
+    // The diff and the gap between it and the PRs.
+    const extra: Width = diffShown ? { text: diffWidth.text, gaps: diffWidth.gaps + 1 } : { text: 0, gaps: 0 }
     const prPart =
       prList.length > 0
         ? listPart(
@@ -1351,10 +1373,11 @@ export const register: Register = (on, options) => {
     }
 
     // A blank line between rows while they all fit in the rows the band may take; packed tight when they don't,
-    // so the list rows stay in view instead of scrolling behind the band's `n more`. The recent-sessions cells
-    // take three rows each.
-    const lines = [awayLine, statusLine, wtLine, agLine, bgLine, workLine].filter(Boolean).length + 1 + (recentLine ? 3 : 0)
-    const spacing = 2 * lines - 1 <= e.props.maxRows ? 1 : 0
+    // so the list rows stay in view instead of scrolling behind the band's `n more`. Each row is one line but
+    // the recent-sessions cells, which take three; the blank lines go between rows.
+    const shown = [awayLine, statusLine, wtLine, agLine, bgLine, workLine, recentLine].filter(Boolean).length + 1
+    const height = shown + (recentLine ? 2 : 0)
+    const spacing = height + shown - 1 <= e.props.maxRows ? 1 : 0
 
     return (
       <Box width="100%" flexDirection="column" rowGap={spacing}>

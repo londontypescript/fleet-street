@@ -37,7 +37,8 @@ Usage and Status Banner Plugin for Claude
     app's task list shows; the command when there is none), with how long it has run. Squeezed: labels cut to
     16, then the first ones and `+N`, then `×N` with the oldest one's age
   - `pr` and `diff`: drawn only when there's an open PR or a diff; then a half with nothing to show is left
-    out, except that `pr unavailable` still shows when `gh` can't answer.
+    out, except that `pr unavailable` stands in for the PRs when `gh` can't answer while the row is up for a
+    diff.
     - `pr`: the open pull requests whose branch is this session's branch or one of the worktrees' (this
       session's first; at most 10 branches are looked up). Each shows its number, its title and its checks as
       passed out of the total: `● 2/4` yellow while any are running, `✗ 3/4` red as soon as one fails, `✓ 4/4`
