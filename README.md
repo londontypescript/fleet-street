@@ -38,7 +38,7 @@ Usage and Status Banner Plugin for Claude
     `origin` remote on github.com; without the remote `pr` isn't shown, and when `gh` can't answer it reads
     `pr unavailable`. If a refresh fails after one has worked (offline, say), the last list stays, dimmed
   - Right: `diff`, the lines added and deleted since the branch left the expected branch (`mainBranch`),
-    uncommitted work and new files included, as `+152 −32`, or `clean`. It compares with the merge-base of
+    uncommitted work and new files included (the lines of the first 200 new files), as `+152 −32`, or `clean`. It compares with the merge-base of
     `HEAD` and `origin/<mainBranch>` (the local `<mainBranch>` when there's no such remote branch), as the refs
     stand locally: nothing is fetched
   - When the row runs out of room, PR titles are cut to 32 characters, then 16, then left out, then the PRs

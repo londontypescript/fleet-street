@@ -122,10 +122,23 @@ const fmtAgo = (ms: number) => {
   return h < 24 ? `${h}h` : `${Math.min(99, Math.floor(h / 24))}d`
 }
 
-// Cut by characters, not UTF-16 units, so an emoji is never split in half.
+// East Asian wide characters and emoji take two terminal cells; everything else one.
+const WIDE = /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60\uffe0-\uffe6\u{1f300}-\u{1faff}\u{20000}-\u{3fffd}]/u
+const cellsOf = (ch: string) => (WIDE.test(ch) ? 2 : 1)
+const cells = (text: string) => Array.from(text).reduce((w, ch) => w + cellsOf(ch), 0)
+
+// Cut to at most max cells, by characters rather than UTF-16 units, so an emoji is never split in half.
 const truncate = (text: string, max: number) => {
-  const chars = Array.from(text)
-  return max <= 0 ? '' : chars.length <= max ? text : `${chars.slice(0, Math.max(0, max - 1)).join('').trimEnd()}…`
+  if (max <= 0) return ''
+  if (cells(text) <= max) return text
+  let out = ''
+  let used = 0
+  for (const ch of text) {
+    if (used + cellsOf(ch) > max - 1) break
+    out += ch
+    used += cellsOf(ch)
+  }
+  return `${out.trimEnd()}…`
 }
 
 // One entry in the middle of row 2: a worktree, a task, or a count standing for several.
@@ -457,12 +470,14 @@ async function readDiff(git: Git): Promise<DiffState> {
     if (m[3] === '') i += 2
   }
   const others = await git('ls-files', '--others', '--exclude-standard', '-z')
-  const untracked = ok(others) ? others.stdout.split('\0').filter(Boolean) : []
+  if (!ok(others) || others.isStdoutTruncated) return { kind: 'unavailable' }
+  const untracked = others.stdout.split('\0').filter(Boolean)
   if (untracked.length > 0) {
     // `<path>\0<lines>` per text file with any lines; binaries (-I) and empty files are left out, and git
     // exits 1 when that leaves nothing.
     const counted = await git('--literal-pathspecs', 'grep', '--untracked', '--no-color', '-I', '-c', '-z', '', '--', ...untracked.slice(0, UNTRACKED_COUNTED))
-    if (counted && counted.exitCode === 0) {
+    if (counted === null || counted.exitCode > 1 || counted.isStdoutTruncated) return { kind: 'unavailable' }
+    if (counted.exitCode === 0) {
       for (const line of counted.stdout.split('\n')) {
         const n = Number(line.split('\0')[1])
         if (Number.isFinite(n)) added += n
@@ -511,7 +526,7 @@ const summariseChecks = (rollup: unknown): Checks | null => {
     else unknown++
   }
   const state = failed > 0 ? 'fail' : running > 0 ? 'running' : unknown > 0 ? 'unknown' : 'pass'
-  return { passed, total: rollup.length, state }
+  return { passed, total: rollup.length, state, running: running > 0 }
 }
 
 // Runs fn over the items, at most limit at once, keeping their order.
@@ -531,8 +546,9 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
 let prsRunning = false
 let prsAgain = false
 let prsStartedAt = 0
-// When the clock next refreshes the PRs.
+// When the clock next refreshes the PRs, and until when a rate-limit reply holds off every refresh.
 let prsDueAt = 0
+let prsBackoffUntil = 0
 // The repository (top folder and slug) the shown PRs belong to, and the reason last logged.
 let prsFor = ''
 let prsLogged = ''
@@ -548,6 +564,8 @@ async function refreshPrs($: EngineInterface) {
     do {
       prsAgain = false
       prsStartedAt = Date.now()
+      // Not due again until this one sets when; otherwise each clock tick while gh runs queues another.
+      prsDueAt = Infinity
       await scanPrs($)
     } while (prsAgain)
   } catch (err) {
@@ -645,7 +663,7 @@ async function scanPrs($: EngineInterface) {
   const now = Date.now()
   if (failed === null) {
     prsLogged = ''
-    prsDueAt = now + (found.some(p => p.checks?.state === 'running') ? PR_FAST_MS : PR_SLOW_MS)
+    prsDueAt = now + (found.some(p => p.checks?.running) ? PR_FAST_MS : PR_SLOW_MS)
     await setPrs($, { kind: 'ok', prs: found, stale: false })
     return
   }
@@ -654,6 +672,7 @@ async function scanPrs($: EngineInterface) {
     $.ui.log(`fleet-street: PRs unavailable: ${failed.reason}`)
   }
   prsDueAt = now + (failed.kind === 'rate' ? PR_BACKOFF_MS : PR_SLOW_MS)
+  if (failed.kind === 'rate') prsBackoffUntil = prsDueAt
   const current = await read($, prs)
   await setPrs(
     $,
@@ -838,7 +857,7 @@ export const register: Register = (on, options) => {
       await markActive($, at)
       // Not awaited: a slow git or gh never holds up the turn.
       void refreshLocal($)
-      if (workVisible && at - prsStartedAt >= PR_TURN_MS) void refreshPrs($)
+      if (workVisible && at - prsStartedAt >= PR_TURN_MS && at >= prsBackoffUntil) void refreshPrs($)
     }
     return next(e)
   })
@@ -1082,7 +1101,7 @@ export const register: Register = (on, options) => {
     // The work row: the open PRs on the left, each with its checks passed out of the total, and the branch's
     // diff against the main branch on the right. Squeezed one step at a time until the whole row fits: titles
     // cut to 32, then to 16, then numbers alone, then a count with the worst mark; failing that, left empty.
-    const len = (text: string) => Array.from(text).length
+    const len = cells
     const prLabel = (p: Pr, max: number | null) => (max === null || p.title === '' ? `#${p.number}` : `#${p.number} ${truncate(p.title, max)}`)
     const checksLabel = (c: Checks) => `${CHECK_MARKS[c.state].mark} ${c.passed}/${c.total}`
     const prWidth = (p: Pr, max: number | null) => len(prLabel(p, max)) + (p.checks ? 1 + len(checksLabel(p.checks)) : 0)

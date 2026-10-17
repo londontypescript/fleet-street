@@ -8,8 +8,9 @@ export type Worktree = { path: string; name: string; branch: string | null; agen
 
 export type RecentSession = { id: string; title: string; updatedAt: number; link: string }
 
-// A PR's reported checks: how many passed out of how many, and the worst result among them.
-export type Checks = { passed: number; total: number; state: 'fail' | 'running' | 'pass' | 'unknown' }
+// A PR's reported checks: how many passed out of how many, the worst result among them, and whether any
+// are still running (a failure outranks them in state, but they still want watching).
+export type Checks = { passed: number; total: number; state: 'fail' | 'running' | 'pass' | 'unknown'; running: boolean }
 export type Pr = { number: number; title: string; url: string; branch: string; draft: boolean; checks: Checks | null }
 // loading: before the first answer; ok: the list, stale once a later refresh failed; unavailable: gh can't answer.
 export type PrState = { kind: 'loading' } | { kind: 'ok'; prs: Pr[]; stale: boolean } | { kind: 'unavailable'; reason: string }
