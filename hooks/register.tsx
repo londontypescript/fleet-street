@@ -122,8 +122,9 @@ const fmtAgo = (ms: number) => {
   return h < 24 ? `${h}h` : `${Math.min(99, Math.floor(h / 24))}d`
 }
 
-// East Asian wide characters and emoji take two terminal cells; everything else one.
-const WIDE = /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60\uffe0-\uffe6\u{1f300}-\u{1faff}\u{20000}-\u{3fffd}]/u
+// East Asian wide characters and emoji take two terminal cells; everything else one. The symbol blocks
+// (misc symbols, dingbats) are counted wide whole: some are narrow, but counting wide only cuts a title sooner.
+const WIDE = /[\u1100-\u115f\u231a\u231b\u23e9-\u23f3\u2600-\u27bf\u2b50\u2b55\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60\uffe0-\uffe6\u{1f000}-\u{1faff}\u{20000}-\u{3fffd}]/u
 const cellsOf = (ch: string) => (WIDE.test(ch) ? 2 : 1)
 const cells = (text: string) => Array.from(text).reduce((w, ch) => w + cellsOf(ch), 0)
 
@@ -567,7 +568,9 @@ async function refreshPrs($: EngineInterface) {
       // Not due again until this one sets when; otherwise each clock tick while gh runs queues another.
       prsDueAt = Infinity
       await scanPrs($)
-    } while (prsAgain)
+    } while (prsAgain && Date.now() >= prsBackoffUntil)
+    // A refresh asked for during a rate-limit backoff waits for the backoff to end.
+    if (prsAgain) prsDueAt = Math.min(prsDueAt, prsBackoffUntil)
   } catch (err) {
     $.ui.log(`fleet-street: PR refresh failed: ${err}`)
     prsDueAt = Date.now() + PR_SLOW_MS
