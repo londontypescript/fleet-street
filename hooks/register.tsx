@@ -1170,27 +1170,6 @@ export const register: Register = (on, options) => {
     type Width = { text: number; gaps: number }
     const fits = (w: Width) => w.text * scale + w.gaps <= e.props.bodyColumns
 
-    // Row 2: the branch on the left, the session time on the right.
-    const elapsed = started !== null ? fmtElapsed(t - started) : null
-    const statusLine =
-      onBranch || elapsed ? (
-        <Box width="100%" flexWrap="nowrap" justifyContent="space-between" columnGap={1}>
-          {onBranch ? (
-            <Text color={onBranch === mainBranch ? 'green' : 'yellow'} bold={onBranch !== mainBranch}>
-              ⎇ {onBranch}
-            </Text>
-          ) : (
-            <Box />
-          )}
-          {elapsed ? (
-            <Box columnGap={1}>
-              <Text bold>time</Text>
-              <Text>{elapsed}</Text>
-            </Box>
-          ) : null}
-        </Box>
-      ) : null
-
     // The list rows (wt, ag, bg, pr) are drawn only when they have something. Each is a label and its entries,
     // squeezed one step at a time until the row fits, and left out when even the last step doesn't.
     type Part = { text: string; color?: string; dim?: boolean; press?: () => void }
@@ -1218,12 +1197,9 @@ export const register: Register = (on, options) => {
         )
         return i === 0 ? [piece] : [sep, piece]
       })
-    // The first layout that fits beside `extra`, something else on the row.
-    const listPart = (label: string, layouts: Piece[][], extra: Width = { text: 0, gaps: 0 }) => {
-      const fit = layouts.find(ps => {
-        const w = piecesWidth(label, ps)
-        return fits({ text: w.text + extra.text, gaps: w.gaps + extra.gaps })
-      })
+    // The first layout that fits.
+    const listPart = (label: string, layouts: Piece[][]) => {
+      const fit = layouts.find(ps => fits(piecesWidth(label, ps)))
       return fit ? (
         <Box flexWrap="nowrap" columnGap={1}>
           <Text bold>{label}</Text>
@@ -1259,6 +1235,7 @@ export const register: Register = (on, options) => {
         ? null
         : fullLine(
             listPart('wt', [
+              ownTrees.map(w => treePiece(w, Infinity)),
               ownTrees.map(w => treePiece(w, 24)),
               ownTrees.map(w => treePiece(w, 12)),
               ...firstAndRest(
@@ -1306,6 +1283,7 @@ export const register: Register = (on, options) => {
         ? null
         : fullLine(
             listPart('ag', [
+              acts.map(a => actPiece(a, Infinity)),
               acts.map(a => actPiece(a, 24)),
               acts.map(a => actPiece(a, 12)),
               acts.map(a => actPiece(a, null)),
@@ -1331,6 +1309,7 @@ export const register: Register = (on, options) => {
         ? null
         : fullLine(
             listPart('bg', [
+              plain.map(b => taskPiece(b, Infinity)),
               plain.map(b => taskPiece(b, 32)),
               plain.map(b => taskPiece(b, 16)),
               ...firstAndRest(
@@ -1341,12 +1320,47 @@ export const register: Register = (on, options) => {
             ]),
           )
 
-    // pr and diff: the open PRs, each with its checks passed out of the total, and the branch's diff against the
-    // main branch. Drawn only when there's a PR or a diff; then a half with nothing to show is left out, except
-    // that a gh that can't answer still says so.
-    const prList = prState?.kind === 'ok' ? prState.prs : []
+    // Row 2: the branch with its diff against the main branch beside it (`+152 −32`, uncommitted work included),
+    // and the session time on the right. The diff is left out when the row has no room for it.
+    const elapsed = started !== null ? fmtElapsed(t - started) : null
+    const diffShown = workOn && diffState?.kind === 'ok' && !diffState.clean
+    const diffNumbers = diffState?.kind === 'ok' ? [`+${diffState.added}`, `−${diffState.deleted}`] : []
+    const branchText = onBranch ? `⎇ ${onBranch}` : ''
+    // The branch, two columns, the two numbers a column apart; at least a column, then `time 26m`.
+    const row2: Width = {
+      text: cells(branchText) + diffNumbers.reduce((w, x) => w + cells(x), 0) + (elapsed ? 4 + cells(elapsed) : 0),
+      gaps: 2 + 1 + (elapsed ? 2 : 0),
+    }
+    const diffPart =
+      diffShown && fits(row2) ? (
+        <Box flexWrap="nowrap" columnGap={1}>
+          <Text color="green">{diffNumbers[0]}</Text>
+          <Text color="red">{diffNumbers[1]}</Text>
+        </Box>
+      ) : null
+    const statusLine =
+      onBranch || elapsed ? (
+        <Box width="100%" flexWrap="nowrap" justifyContent="space-between" columnGap={1}>
+          <Box flexWrap="nowrap" columnGap={2}>
+            {onBranch ? (
+              <Text color={onBranch === mainBranch ? 'green' : 'yellow'} bold={onBranch !== mainBranch}>
+                {branchText}
+              </Text>
+            ) : null}
+            {diffPart}
+          </Box>
+          {elapsed ? (
+            <Box columnGap={1}>
+              <Text bold>time</Text>
+              <Text>{elapsed}</Text>
+            </Box>
+          ) : null}
+        </Box>
+      ) : null
+
+    // pr: the open PRs, each with its checks passed out of the total; drawn only while one is open.
+    const prList = workOn && prState?.kind === 'ok' ? prState.prs : []
     const stale = prState?.kind === 'ok' && prState.stale
-    const diffShown = diffState?.kind === 'ok' && !diffState.clean
     const prLabel = (p: Pr, max: number | null) => (max === null || p.title === '' ? `#${p.number}` : `#${p.number} ${truncate(p.title, max)}`)
     const checksPart = (state: Checks['state'], text: string): Part => ({
       text,
@@ -1364,43 +1378,18 @@ export const register: Register = (on, options) => {
       (w, p) => (p.checks && (w === null || CHECK_MARKS[p.checks.state].rank > CHECK_MARKS[w].rank) ? p.checks.state : w),
       null,
     )
-    const diffNumbers = diffState?.kind === 'ok' ? [`+${diffState.added}`, `−${diffState.deleted}`] : []
-    // `diff main +152 −32`: four texts with a gap after each of the first three.
-    const diffWidth: Width = diffShown
-      ? { text: 4 + cells(mainBranch) + diffNumbers.reduce((w, x) => w + cells(x), 0), gaps: 1 + diffNumbers.length }
-      : { text: 0, gaps: 0 }
-    const diffPart = diffShown ? (
-      <Box flexWrap="nowrap" columnGap={1}>
-        <Text bold>diff</Text>
-        <Text dimColor>{mainBranch}</Text>
-        <Text color="green">{diffNumbers[0]}</Text>
-        <Text color="red">{diffNumbers[1]}</Text>
-      </Box>
-    ) : null
-    // The diff and the gap between it and the PRs.
-    const extra: Width = diffShown ? { text: diffWidth.text, gaps: diffWidth.gaps + 1 } : { text: 0, gaps: 0 }
-    const prPart =
-      prList.length > 0
-        ? listPart(
-            'pr',
-            [
+    const prLine =
+      prList.length === 0
+        ? null
+        : fullLine(
+            listPart('pr', [
+              prList.map(p => prPiece(p, Infinity)),
               prList.map(p => prPiece(p, 32)),
               prList.map(p => prPiece(p, 16)),
               prList.map(p => prPiece(p, null)),
               [countPiece(prList.length, undefined, ...(worstCheck ? [checksPart(worstCheck, CHECK_MARKS[worstCheck].mark)] : []))],
-            ],
-            extra,
+            ]),
           )
-        : prState?.kind === 'unavailable' && diffShown
-          ? listPart('pr', [[{ key: 'na', parts: [{ text: 'unavailable', dim: true }] }]], extra)
-          : null
-    const workLine =
-      workOn && (prPart || diffShown) && fits(diffWidth) ? (
-        <Box width="100%" flexWrap="nowrap" justifyContent="space-between" columnGap={1}>
-          {prPart ?? <Box />}
-          {diffPart}
-        </Box>
-      ) : null
 
     // Recent sessions: three equal rounded cells spread edge to edge, each with its title and age
     // together in the middle. The terminal cuts a title to the cell's columns; a desktop draws a proportional
@@ -1437,14 +1426,14 @@ export const register: Register = (on, options) => {
         </Box>
       ) : null
 
-    if (!awayLine && !statusLine && !wtLine && !agLine && !bgLine && !workLine && !recentLine) {
+    if (!awayLine && !statusLine && !wtLine && !agLine && !bgLine && !prLine && !recentLine) {
       return firstLine
     }
 
     // A blank line between rows while they all fit in the rows the band may take; packed tight when they don't,
     // so the list rows stay in view instead of scrolling behind the band's `n more`. Each row is one line but
     // the recent-sessions cells, which take three; the blank lines go between rows.
-    const shown = [awayLine, statusLine, wtLine, agLine, bgLine, workLine, recentLine].filter(Boolean).length + 1
+    const shown = [awayLine, statusLine, wtLine, agLine, bgLine, prLine, recentLine].filter(Boolean).length + 1
     const height = shown + (recentLine && sessions !== null && sessions.length > 0 ? 2 : 0)
     const spacing = height + shown - 1 <= e.props.maxRows ? 1 : 0
 
@@ -1456,7 +1445,7 @@ export const register: Register = (on, options) => {
         {wtLine}
         {agLine}
         {bgLine}
-        {workLine}
+        {prLine}
         {recentLine}
       </Box>
     )
