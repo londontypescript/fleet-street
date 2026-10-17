@@ -695,12 +695,17 @@ const CHECK_MARKS: Record<Checks['state'], { mark: string; color: string | undef
 // GitHub's own page, only the latest run of each check counts: by workflow and name, or a status's context.
 // A failure wins over running checks; a value not known here makes the result unknown.
 const latestChecks = (rollup: Record<string, unknown>[]) => {
+  // ISO times compare as strings. A run not started yet (no time, or GitHub's zero time 0001-01-01) is a
+  // queued re-run, so it counts as the latest; between two such, the later in the rollup's order.
+  const startOf = (c: Record<string, unknown>) => {
+    const at = String(c.startedAt ?? '')
+    return at === '' || at.startsWith('0001-') ? '\uffff' : at
+  }
   const latest = new Map<string, Record<string, unknown>>()
   for (const c of rollup) {
     const key = `${String(c.workflowName ?? '')}\0${String(c.name ?? c.context ?? '')}`
     const kept = latest.get(key)
-    // ISO times compare as strings; one without a time counts as later, as the rollup lists runs in order.
-    if (!kept || String(c.startedAt ?? '\uffff') >= String(kept.startedAt ?? '')) latest.set(key, c)
+    if (!kept || startOf(c) >= startOf(kept)) latest.set(key, c)
   }
   return [...latest.values()]
 }

@@ -28,19 +28,17 @@ Usage and Status Banner Plugin for Claude
   (at most half the terminal); when they wouldn't, they're packed tight. Each is a label and its entries; when a row runs out of room it is squeezed a step at a time, as
   each row's entry says (full titles first), and on a row too narrow even for its last step the row is left
   out.
-  - `wt`: the repository's other worktrees that you made, each by its branch (by its folder when detached),
-    cut to 24 characters. Subagents' worktrees (`.claude/worktrees/agent-…`) are left out: their agents are on
-    `ag`. Squeezed: names cut to 12, then the first names and `+N`, then `×N`
+  - `wt`: the repository's other worktrees that you made, each by its branch (by its folder when detached). Subagents' worktrees (`.claude/worktrees/agent-…`) are left out: their agents are on
+    `ag`. Squeezed: names cut to 24, then 12, then the first names and `+N`, then `×N`
   - `ag`: this session's subagents, from Claude Code's own agent list, each with its description, its model and
-    effort (`Opus High`, `Sonnet Med`; the model shows from its first step, the effort from its first tool
-    call), a mark (`●` running, `○` waiting or idle, `✓` done, `✗` failed) and how long it has run. A finished
+    effort (`Opus High`, `Sonnet Med`, from its first step), a mark (`●` running, `○` waiting or idle, `✓` done, `✗` failed) and how long it has run. A finished
     one stays for two minutes. Background runs of ChatGPT through the Codex CLI (`codex-locked`, `codex exec`)
     are listed here too, as `Sol High` and the like, read from the command's `-m` and
-    `model_reasoning_effort`. Squeezed: descriptions cut to 12, then left out, then grouped by model
+    `model_reasoning_effort`. Squeezed: descriptions cut to 24, then 12, then left out, then grouped by model
     (`Opus High ×2 ●`), then `×N` with the most urgent mark
   - `bg`: the background shells and monitors, each by the description Claude gave its call (the title the
     app's task list shows; the command when there is none), with how long it has run. Squeezed: labels cut to
-    16, then the first ones and `+N`, then `×N` with the oldest one's age
+    32, then 16, then the first ones and `+N`, then `×N` with the oldest one's age
   - `pr`: the open pull requests whose branch is this session's branch or one of the worktrees' (this
     session's first; at most 10 branches are looked up). Each shows its number, its title and its checks as
     passed out of the total: `● 2/4` yellow while any are running, `✗ 3/4` red as soon as one fails, `✓ 4/4`
