@@ -298,6 +298,19 @@ const OPENERS: Record<DesktopOs, (link: string) => string[]> = {
   linux: link => ['xdg-open', link],
 }
 
+// A PR opens in the browser through the same openers. A terminal without OSC 8 links would print a Link's URL
+// after its text, so PRs are Buttons instead. The OS is known only once the desktop app's folder was found;
+// otherwise Windows is told by APPDATA, and macOS's opener is tried before Linux's.
+const openUrl = async ($: EngineInterface, url: string) => {
+  const os = sessionsRoot?.os ?? ((await $.env.get('APPDATA')) ? 'windows' : undefined)
+  const tries = os ? [OPENERS[os](url)] : [OPENERS.macos(url), OPENERS.linux(url)]
+  for (const argv of tries) {
+    const ran = await $.process.run(argv).catch(() => null)
+    if (ran && ran.exitCode === 0) return
+  }
+  $.ui.toast(`Could not open ${url}`)
+}
+
 const openSession = async ($: EngineInterface, link: string) => {
   if (!sessionsRoot) return
   const ran = await $.process.run(OPENERS[sessionsRoot.os](link)).catch(err => ({ exitCode: 1, stderr: String(err) }))
@@ -325,7 +338,8 @@ const githubSlug = (url: string) => {
 }
 
 let branchShown: string | null | undefined
-let worktreesShown = ''
+// undefined until the first publish, which always goes through: the state outlives a hot reload of this module.
+let worktreesShown: string | undefined
 let treesKnown: Worktree[] = []
 let diffShown = ''
 
@@ -870,7 +884,7 @@ export const register: Register = (on, options) => {
       return next(e)
     }
 
-    const { Box, Button, Link, Text } = $.ui.resolve(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
     const t = await read($, now)
     const ls = await read($, limits)
     const ctx = await read($, context)
@@ -1136,9 +1150,7 @@ export const register: Register = (on, options) => {
         const width = 2 + listed.reduce((w, p) => w + 1 + prWidth(p, max), 0) + 2 * (listed.length - 1)
         const items = listed.map(p => (
           <Box key={`pr:${p.number}`} flexWrap="nowrap" columnGap={1}>
-            <Link href={p.url}>
-              <Text dimColor={p.draft || stale}>{prLabel(p, max)}</Text>
-            </Link>
+            <Button key={`p:${p.number}`} label={prLabel(p, max)} plain dimColor={p.draft || stale} onPress={() => openUrl($, p.url)} />
             {p.checks ? markText(p.checks.state, checksLabel(p.checks)) : null}
           </Box>
         ))
