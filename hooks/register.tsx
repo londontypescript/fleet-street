@@ -134,24 +134,69 @@ const modelLabel = (model: string | undefined, effort: string | undefined) =>
 // A run of another provider's agent through the Codex CLI (codex-locked, or codex exec): its model from
 // -m/--model and its effort from model_reasoning_effort, as 'Sol High'; undefined for any other command. Each
 // part of a compound command is looked at on its own, so `git commit -m x && codex exec ...` reads codex's -m.
+// A command line split into the commands it runs, each as its words, the shell's way as far as this needs:
+// quotes keep a word together and are removed, a backslash keeps the next character, and ; & && || | and
+// newlines outside quotes end a command (but not the & of a redirection such as 2>&1).
+const shellCommands = (line: string): string[][] => {
+  const commands: string[][] = []
+  let words: string[] = []
+  let word: string | null = null
+  let quote: string | null = null
+  const endWord = () => {
+    if (word !== null) words.push(word)
+    word = null
+  }
+  const endCommand = () => {
+    endWord()
+    if (words.length > 0) commands.push(words)
+    words = []
+  }
+  for (let i = 0; i < line.length; i++) {
+    const ch = line.charAt(i)
+    if (quote !== null) {
+      if (ch === quote) quote = null
+      else word = (word ?? '') + ch
+    } else if (ch === "'" || ch === '"') {
+      quote = ch
+      word = word ?? ''
+    } else if (ch === '\\' && i + 1 < line.length) {
+      word = (word ?? '') + line.charAt(++i)
+    } else if (ch === '&' && word !== null && /[<>]$/.test(word)) {
+      word += ch
+    } else if (ch === ';' || ch === '&' || ch === '|' || ch === '\n') {
+      if ((ch === '&' || ch === '|') && line.charAt(i + 1) === ch) i++
+      endCommand()
+    } else if (/\s/.test(ch)) {
+      endWord()
+    } else {
+      word = (word ?? '') + ch
+    }
+  }
+  endCommand()
+  return commands
+}
+
 const codexModel = (command: string) => {
-  for (const segment of command.split(/&&|\|\||[;|\n]/)) {
-    const words = segment.trim().split(/\s+/).map(w => w.replace(/^['"]+|['"]+$/g, ''))
-    // The program the segment runs, past any VAR=value before it.
-    const program = words.find(w => !/^\w+=/.test(w))?.split('/').pop()
-    if (program !== 'codex-locked' && !(program === 'codex' && words.includes('exec'))) continue
-    const flag = words.findIndex(w => w === '-m' || w === '--model')
-    const model = (flag >= 0 ? words[flag + 1] : words.find(w => w.startsWith('--model='))?.slice(8)) || 'codex'
-    const effort = /model_reasoning_effort\s*=\s*['"]*([a-z]+)/.exec(segment)?.[1]
+  for (const words of shellCommands(command)) {
+    // The program the command runs, past any VAR=value and env in front of it.
+    let i = 0
+    while (i < words.length && (words[i] === 'env' || /^\w+=/.test(words[i] ?? ''))) i++
+    const program = words[i]?.split('/').pop()
+    const args = words.slice(i + 1)
+    if (program !== 'codex-locked' && !(program === 'codex' && args.includes('exec'))) continue
+    const flag = args.findIndex(w => w === '-m' || w === '--model')
+    const model = (flag >= 0 ? args[flag + 1] : args.find(w => w.startsWith('--model='))?.slice(8)) || 'codex'
+    const effort = args.map(w => /^model_reasoning_effort=['"]*([a-z]+)/.exec(w)?.[1]).find(Boolean)
     return modelLabel(model, effort)
   }
   return undefined
 }
 
-// What each subagent's steps and tool calls have shown of its model and effort, by agent id. Only read from
-// events as they pass: nothing hooks a subagent's start, which crashed the mod for subagents in worktrees.
-const agentModels = new Map<string, string>()
-const agentEfforts = new Map<string, string>()
+// The model and effort each subagent's latest step asked for, by agent id, and when. Only read from events as
+// they pass: nothing hooks a subagent's start, which crashed the mod for subagents in worktrees.
+const agentNotes = new Map<string, { model: string; effort?: string; at: number }>()
+// How long notes for an agent the list never showed are kept.
+const AGENT_NOTE_MS = 10 * 60_000
 // When each agent was first seen and first seen finished, and how it last looked.
 const agentSeen = new Map<string, { firstSeen: number; endedAt?: number; last?: Subagent }>()
 const FINISHED = new Set(['completed', 'failed', 'killed'])
@@ -160,56 +205,81 @@ const AGENT_DONE_MS = 2 * 60_000
 
 let agentsShown: string | undefined
 let agentsRunning = false
+let agentsAgain = false
 let agentsFailed = false
 
 // The session's subagents from the engine's own list, polled: running ones, and finished ones for two minutes.
 async function refreshAgents($: EngineInterface) {
-  if (agentsRunning) return
+  if (agentsRunning) {
+    agentsAgain = true
+    return
+  }
   agentsRunning = true
   try {
-    const t = Date.now()
-    const list = await $.agent.list()
-    const ids = new Set<string>()
-    for (const a of list) {
-      ids.add(a.id)
-      const seen = agentSeen.get(a.id) ?? { firstSeen: t }
-      // A finished agent may be resumed under its id: it is running again, not finished.
-      seen.endedAt = FINISHED.has(a.status) ? (seen.endedAt ?? t) : undefined
-      seen.last = {
-        id: a.id,
-        description: (a.description || a.name || a.type).replace(/\s+/g, ' ').trim(),
-        status: a.status,
-        model: modelLabel(agentModels.get(a.id), agentEfforts.get(a.id)),
-        firstSeen: seen.firstSeen,
-        endedAt: seen.endedAt,
-      }
-      agentSeen.set(a.id, seen)
-    }
-    // One the engine has dropped stays as it was last seen, finished, for the rest of its two minutes.
-    for (const [id, seen] of agentSeen) {
-      if (!ids.has(id) && seen.last) {
-        seen.endedAt ??= t
-        seen.last = { ...seen.last, status: FINISHED.has(seen.last.status) ? seen.last.status : 'completed', endedAt: seen.endedAt }
-      }
-      if (seen.endedAt !== undefined && t - seen.endedAt > AGENT_DONE_MS) agentSeen.delete(id)
-    }
-    // What steps and tool calls noted for agents no longer kept, including ones the list never showed.
-    for (const map of [agentModels, agentEfforts]) {
-      for (const id of [...map.keys()]) if (!agentSeen.has(id) && !ids.has(id)) map.delete(id)
-    }
-    const found = [...agentSeen.values()].flatMap(s => (s.last ? [s.last] : []))
+    do {
+      agentsAgain = false
+      await scanAgents($)
+    } while (agentsAgain)
     agentsFailed = false
-    const key = JSON.stringify(found)
-    if (key !== agentsShown) {
-      agentsShown = key
-      await update($, agents, () => found)
-    }
   } catch (err) {
     if (!agentsFailed) $.ui.log(`fleet-street: agent list failed: ${err}`)
     agentsFailed = true
   } finally {
     agentsRunning = false
   }
+}
+
+async function scanAgents($: EngineInterface) {
+  const t = Date.now()
+  const list = await $.agent.list()
+  const ids = new Set<string>()
+  for (const a of list) {
+    ids.add(a.id)
+    const seen = agentSeen.get(a.id) ?? { firstSeen: t }
+    // A finished agent may be resumed under its id: it is running again, not finished.
+    seen.endedAt = FINISHED.has(a.status) ? (seen.endedAt ?? t) : undefined
+    const noted = agentNotes.get(a.id)
+    seen.last = {
+      id: a.id,
+      description: (a.description || a.name || a.type).replace(/\s+/g, ' ').trim(),
+      status: a.status,
+      model: modelLabel(noted?.model, noted?.effort),
+      firstSeen: seen.firstSeen,
+      endedAt: seen.endedAt,
+    }
+    agentSeen.set(a.id, seen)
+  }
+  const expired = (s: { endedAt?: number }) => s.endedAt !== undefined && t - s.endedAt > AGENT_DONE_MS
+  for (const [id, seen] of agentSeen) {
+    // One the engine has dropped stays as it was last seen, finished, for the rest of its two minutes.
+    if (!ids.has(id) && seen.last) {
+      seen.endedAt ??= t
+      seen.last = { ...seen.last, status: FINISHED.has(seen.last.status) ? seen.last.status : 'completed', endedAt: seen.endedAt }
+    }
+    // Kept while the engine lists it, so an expired one isn't taken for new; hidden once expired.
+    if (!ids.has(id) && expired(seen)) {
+      agentSeen.delete(id)
+      agentNotes.delete(id)
+    }
+  }
+  // Notes for an agent never listed (it came and went between polls) go once they're stale.
+  for (const [id, noted] of agentNotes) {
+    if (!agentSeen.has(id) && !ids.has(id) && t - noted.at > AGENT_NOTE_MS) agentNotes.delete(id)
+  }
+  const found = [...agentSeen.values()].flatMap(s => (s.last && !expired(s) ? [s.last] : []))
+  const key = JSON.stringify(found)
+  if (key !== agentsShown) {
+    agentsShown = key
+    await update($, agents, () => found)
+  }
+}
+
+// A subagent's step names its model and effort before its request goes; noted, and the list refreshed when
+// that's news or the agent is new.
+function noteAgentStep($: EngineInterface, id: string, model: string, effort: string | undefined) {
+  const noted = agentNotes.get(id)
+  agentNotes.set(id, { model, effort, at: Date.now() })
+  if (!agentSeen.has(id) || noted?.model !== model || noted.effort !== effort) void refreshAgents($)
 }
 
 const RECENT_COUNT = 3
@@ -841,7 +911,8 @@ export const register: Register = (on, options) => {
       const t = Date.now()
       // A checkout made outside the session (another terminal) shows within five seconds.
       if (Math.floor(t / 1000) % 5 === 0) void refreshLocal($)
-      if (Math.floor(t / 1000) % 2 === 0) void refreshAgents($)
+      // A safety net: subagents are refreshed as their steps and turns come.
+      if (Math.floor(t / 1000) % 5 === 0) void refreshAgents($)
       if (workVisible && t >= prsDueAt) void refreshPrs($)
       if (Math.floor(t / 1000) % 15 === 0) void refreshRecent($).catch(() => {})
       const left = lastAt === null ? Infinity : lastAt + ttl - t
@@ -943,16 +1014,6 @@ export const register: Register = (on, options) => {
     return result
   })
 
-  // A subagent's tool call carries its id and the effort it runs at.
-  on('classic.PostToolUse', async ($, e, next) => {
-    const level = e.effort?.level
-    if (e.agent_id && level && agentEfforts.get(e.agent_id) !== level) {
-      agentEfforts.set(e.agent_id, level)
-      void refreshAgents($)
-    }
-    return next(e)
-  })
-
   on('session.measure', async ($, e, next) => {
     ttl = e.rateLimits.length > 0 ? TTL_SUBSCRIPTION_MS : TTL_API_MS
     await update($, limits, () => e.rateLimits)
@@ -961,13 +1022,8 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.step', async function* ($, e, next) {
+    if (e.agentId !== undefined) noteAgentStep($, e.agentId, e.model, typeof e.effort === 'string' ? e.effort : undefined)
     const result = yield* next(e)
-    // A subagent's step names the model it ran on; only noted here, the agent list's refresh draws it.
-    const model = e.agentId !== undefined ? result.usage?.model : undefined
-    if (e.agentId !== undefined && model && agentModels.get(e.agentId) !== model) {
-      agentModels.set(e.agentId, model)
-      void refreshAgents($)
-    }
     if (e.agentId === undefined) {
       const at = Date.now()
       lastAt = at
@@ -987,6 +1043,9 @@ export const register: Register = (on, options) => {
       // Not awaited: a slow git or gh never holds up the turn.
       void refreshLocal($)
       if (workVisible && at - prsStartedAt >= PR_TURN_MS && at >= prsBackoffUntil) void refreshPrs($)
+    } else {
+      // A subagent's turn ended: it may have finished.
+      void refreshAgents($)
     }
     return next(e)
   })
@@ -997,7 +1056,9 @@ export const register: Register = (on, options) => {
     }
 
     const { Box, Button, Text } = $.ui.resolve(e)
-    const t = await read($, now)
+    // The clock's ticks set `now` to redraw, but they fall behind while the engine is busy; every redraw uses
+    // the real time.
+    const t = Math.max(await read($, now), Date.now())
     const ls = await read($, limits)
     const ctx = await read($, context)
     const last = await read($, lastResponseAt)
@@ -1376,7 +1437,7 @@ export const register: Register = (on, options) => {
     // so the list rows stay in view instead of scrolling behind the band's `n more`. Each row is one line but
     // the recent-sessions cells, which take three; the blank lines go between rows.
     const shown = [awayLine, statusLine, wtLine, agLine, bgLine, workLine, recentLine].filter(Boolean).length + 1
-    const height = shown + (recentLine ? 2 : 0)
+    const height = shown + (recentLine && sessions !== null && sessions.length > 0 ? 2 : 0)
     const spacing = height + shown - 1 <= e.props.maxRows ? 1 : 0
 
     return (
