@@ -189,7 +189,7 @@ const codexModel = (command: string) => {
     if (program !== 'codex-locked' && !(program === 'codex' && args.includes('exec'))) continue
     const flag = args.findIndex(w => w === '-m' || w === '--model')
     const model = (flag >= 0 ? args[flag + 1] : args.find(w => w.startsWith('--model='))?.slice(8)) || 'codex'
-    const effort = args.map(w => /^model_reasoning_effort\s*=\s*['"]*([a-z]+)/.exec(w)?.[1]).find(Boolean)
+    const effort = args.map(w => /^(?:--config=)?model_reasoning_effort\s*=\s*['"]*([a-z]+)/.exec(w)?.[1]).find(Boolean)
     return modelLabel(model, effort)
   }
   return undefined
@@ -672,11 +672,10 @@ const PR_TURN_MS = 15_000
 // A check run's conclusion, or a legacy status context's state, that counts as failed or passed.
 const CHECK_FAILED = new Set(['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE', 'STALE', 'ERROR'])
 const CHECK_PASSED = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED'])
-// How each result is drawn, and which wins when a count stands for several PRs.
-// How a subagent's status is drawn, and which wins when one mark stands for several.
 // The colour of an agent's model and effort on the ag row.
 const MODEL_COLOR = '#f28c28'
 
+// How a subagent's status is drawn, and which wins when one mark stands for several.
 const AGENT_MARKS: Record<Subagent['status'], { mark: string; color: string | undefined; rank: number }> = {
   failed: { mark: '✗', color: 'red', rank: 4 },
   killed: { mark: '✗', color: 'red', rank: 4 },
@@ -686,6 +685,7 @@ const AGENT_MARKS: Record<Subagent['status'], { mark: string; color: string | un
   idle: { mark: '○', color: undefined, rank: 1 },
   completed: { mark: '✓', color: 'green', rank: 0 },
 }
+// How each result is drawn, and which wins when a count stands for several PRs.
 const CHECK_MARKS: Record<Checks['state'], { mark: string; color: string | undefined; rank: number }> = {
   fail: { mark: '✗', color: 'red', rank: 3 },
   running: { mark: '●', color: 'yellow', rank: 2 },
@@ -699,11 +699,14 @@ const CHECK_MARKS: Record<Checks['state'], { mark: string; color: string | undef
 // A failure wins over running checks; a value not known here makes the result unknown.
 const latestChecks = (rollup: Record<string, unknown>[]) => {
   // ISO times compare as strings. A run not started yet (no time, or GitHub's zero time 0001-01-01) is a
-  // queued re-run, so it counts as the latest; between two such, the later in the rollup's order.
-  const startOf = (c: Record<string, unknown>) => {
-    const at = String(c.startedAt ?? '')
-    return at === '' || at.startsWith('0001-') ? '\uffff' : at
+  // queued re-run, so it counts as the latest; between two such, the later in the rollup's order. One that
+  // finished without starting (cancelled while queued) goes by when it finished, so its re-run still wins.
+  const timeOf = (value: unknown) => {
+    const at = String(value ?? '')
+    return at === '' || at.startsWith('0001-') ? null : at
   }
+  const startOf = (c: Record<string, unknown>) =>
+    timeOf(c.startedAt) ?? (c.status === 'COMPLETED' ? (timeOf(c.completedAt) ?? '') : '\uffff')
   const latest = new Map<string, Record<string, unknown>>()
   for (const c of rollup) {
     const key = `${String(c.workflowName ?? '')}\0${String(c.name ?? c.context ?? '')}`
@@ -1355,52 +1358,69 @@ export const register: Register = (on, options) => {
     const diffShown = workOn && diffState?.kind === 'ok' && !diffState.clean
     const diffNumbers = diffState?.kind === 'ok' ? [`+${diffState.added}`, `−${diffState.deleted}`] : []
     const branchText = onBranch ? `⎇ ${onBranch}` : ''
-    // The branch; with the diff, two columns and the two numbers a column apart; with worktrees, a column and
-    // the wt part; with the time, a column and `time 26m`.
-    const row2Width = (diff: boolean, wt: Piece[] | null): Width => {
-      const wtWidth = wt ? piecesWidth('wt', wt) : { text: 0, gaps: 0 }
-      return {
-        text: cells(branchText) + (diff ? diffNumbers.reduce((w, x) => w + cells(x), 0) : 0) + wtWidth.text + (elapsed ? 4 + cells(elapsed) : 0),
-        gaps: (diff ? 3 : 0) + (wt ? 1 + wtWidth.gaps : 0) + (elapsed ? 2 : 0),
-      }
+    // The branch, and with the diff two columns and the two numbers a column apart; `time 26m`. With worktrees in
+    // the middle both sides take the wider one's columns, so the middle sits at the true centre: two sides, a
+    // column either side of the middle, and the wt part.
+    const leftWidth = (diff: boolean): Width => ({
+      text: cells(branchText) + (diff ? diffNumbers.reduce((w, x) => w + cells(x), 0) : 0),
+      gaps: diff ? 3 : 0,
+    })
+    const rightWidth: Width = { text: elapsed ? 4 + cells(elapsed) : 0, gaps: elapsed ? 1 : 0 }
+    const columns = (w: Width) => Math.ceil(w.text * scale) + w.gaps
+    const sideColumns = (diff: boolean) => Math.max(columns(leftWidth(diff)), columns(rightWidth))
+    const row2Fits = (diff: boolean, wt: Piece[] | null) => {
+      if (!wt) return columns(leftWidth(diff)) + 1 + columns(rightWidth) <= e.props.bodyColumns
+      const mid = piecesWidth('wt', wt)
+      return 2 * sideColumns(diff) + 2 + mid.text * scale + mid.gaps <= e.props.bodyColumns
     }
     const row2Fit = [
       ...wtLayouts.map(wt => ({ diff: diffShown, wt })),
       { diff: diffShown, wt: null },
       { diff: false, wt: null },
-    ].find(c => fits(row2Width(c.diff, c.wt))) ?? { diff: false, wt: null }
+    ].find(c => row2Fits(c.diff, c.wt)) ?? { diff: false, wt: null }
     const diffPart = row2Fit.diff ? (
       <Box flexWrap="nowrap" columnGap={1}>
         <Text color="green">{diffNumbers[0]}</Text>
         <Text color="red">{diffNumbers[1]}</Text>
       </Box>
     ) : null
-    const wtPart = row2Fit.wt ? (
-      <Box flexWrap="nowrap" columnGap={1}>
-        <Text bold>wt</Text>
-        {drawPieces(row2Fit.wt)}
-      </Box>
-    ) : null
-    const statusLine =
-      onBranch || elapsed || wtPart ? (
-        <Box width="100%" flexWrap="nowrap" justifyContent="space-between" columnGap={1}>
-          <Box flexWrap="nowrap" columnGap={2}>
-            {onBranch ? (
-              <Text color={onBranch === mainBranch ? 'green' : 'yellow'} bold={onBranch !== mainBranch}>
-                {branchText}
-              </Text>
-            ) : null}
-            {diffPart}
-          </Box>
-          {wtPart}
-          {elapsed ? (
-            <Box columnGap={1}>
-              <Text bold>time</Text>
-              <Text>{elapsed}</Text>
-            </Box>
+    const branchPart =
+      onBranch || diffPart ? (
+        <Box flexWrap="nowrap" columnGap={2}>
+          {onBranch ? (
+            <Text color={onBranch === mainBranch ? 'green' : 'yellow'} bold={onBranch !== mainBranch}>
+              {branchText}
+            </Text>
           ) : null}
+          {diffPart}
         </Box>
       ) : null
+    const timePart = elapsed ? (
+      <Box columnGap={1}>
+        <Text bold>time</Text>
+        <Text>{elapsed}</Text>
+      </Box>
+    ) : null
+    const side = sideColumns(row2Fit.diff)
+    const statusLine = row2Fit.wt ? (
+      <Box width="100%" flexWrap="nowrap" columnGap={1}>
+        <Box width={side} flexShrink={0} flexWrap="nowrap">
+          {branchPart}
+        </Box>
+        <Box flexGrow={1} flexWrap="nowrap" justifyContent="center" columnGap={1}>
+          <Text bold>wt</Text>
+          {drawPieces(row2Fit.wt)}
+        </Box>
+        <Box width={side} flexShrink={0} flexWrap="nowrap" justifyContent="flex-end">
+          {timePart}
+        </Box>
+      </Box>
+    ) : branchPart || timePart ? (
+      <Box width="100%" flexWrap="nowrap" justifyContent="space-between" columnGap={1}>
+        {branchPart ?? <Box />}
+        {timePart}
+      </Box>
+    ) : null
 
     // pr: the open PRs, each with its checks passed out of the total; drawn only while one is open.
     const prList = workOn && prState?.kind === 'ok' ? prState.prs : []
