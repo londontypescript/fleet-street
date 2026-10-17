@@ -2,7 +2,7 @@
   "name": "fleet-street",
   "version": "0.1.0",
   "author": { "name": "Nnsée Nain" },
-  "description": "Banner above the prompt: limits, context, prompt-cache countdown, session timer, git branch, worktrees, background tasks, open PRs with their checks, and the branch's diff",
+  "description": "Banner above the prompt: limits, context, prompt-cache countdown, session timer, git branch, worktrees, subagents with their models, background tasks, open PRs with their checks, and the branch's diff",
   "types": "./types/index.d.ts",
   "userConfig": {
     "awayMinutes": {
@@ -20,7 +20,7 @@
     "showWork": {
       "type": "boolean",
       "title": "Show PRs and diff",
-      "description": "Show the row of open PRs (with their checks) and the branch's diff against the expected branch",
+      "description": "Show the row of open PRs (with their checks) and the diff beside the branch, against the expected branch",
       "default": true
     },
     "showSessions": {

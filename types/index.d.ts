@@ -1,7 +1,19 @@
 export type Limit = { kind: string; percentUsed: number; resetsAt?: string }
 export type Context = { tokens?: number; window: number; percent?: number }
 export type Away = { gapMs: number }
-export type BgTask = { id: string; label: string; startedAt: number }
+// model: set for a background run of another provider's agent (a ChatGPT Sol review through codex-locked),
+// shown with the subagents rather than as a plain task, e.g. 'Sol High'.
+export type BgTask = { id: string; label: string; startedAt: number; model?: string }
+// A subagent of this session as the agent list reports it, with its model and effort once a step or a tool
+// call has shown them (e.g. 'Opus High'); endedAt once it was first seen finished.
+export type Subagent = {
+  id: string
+  description: string
+  status: 'pending' | 'running' | 'waiting' | 'idle' | 'completed' | 'failed' | 'killed'
+  model?: string
+  firstSeen: number
+  endedAt?: number
+}
 // agent: a worktree the app made for a subagent (.claude/worktrees/agent-…, branch worktree-agent-…).
 // branch: the branch checked out there, null when detached (name is then its folder).
 export type Worktree = { path: string; name: string; branch: string | null; agent: boolean }
@@ -29,6 +41,7 @@ declare module 'claude-code' {
       worktrees: Worktree[]
       branch: string | null
       bgTasks: BgTask[]
+      agents: Subagent[]
       recent: RecentSession[] | null
       sessionsShown: boolean | null
       prs: PrState | null
