@@ -831,6 +831,7 @@ let prsBackoffUntil = 0
 let prsFor = ''
 let prsLogged = ''
 let prsShown = ''
+let extrasLogged = ''
 
 async function refreshPrs($: EngineInterface) {
   if (prsRunning) {
@@ -892,6 +893,7 @@ async function scanPrs($: EngineInterface) {
   const slug = ctx.slug
   const repo = `${ctx.top}\0${slug}`
   const shown = await read($, prs)
+  const sameRepo = repo === prsFor
   // Only the branches changed: keep what's known for those still here until the answer lands.
   if (repo === prsFor && shown?.kind === 'ok') {
     await setPrs($, { ...shown, prs: shown.prs.filter(p => ctx.branches.includes(p.branch)) })
@@ -939,8 +941,9 @@ async function scanPrs($: EngineInterface) {
     }
     if (f && (!failed || rank[f.kind] > rank[failed.kind])) failed = f
   }
-  // Reads one more gh answer as JSON, or counts it among the failures.
-  const parsed = (ran: { run: ProcessRunResult } | { error: string }): unknown => {
+  // The milestone and the runs are extras: when gh can't answer for them (a repository with issues turned
+  // off, say), the PRs still show and these keep what they last showed.
+  const extra = (ran: { run: ProcessRunResult } | { error: string }): unknown => {
     let f = classifyGh(slug, ran)
     if (f === null && 'run' in ran) {
       try {
@@ -949,26 +952,36 @@ async function scanPrs($: EngineInterface) {
         f = { kind: 'stale', reason: 'gh gave an unreadable reply' }
       }
     }
-    if (f && (!failed || rank[f.kind] > rank[failed.kind])) failed = f
-    return null
-  }
-
-  const milestoneList = parsed(milestones)
-  const milestone = Array.isArray(milestoneList) ? pickMilestone(milestoneList as Record<string, unknown>[], milestoneName) : null
-  const runsFound = parsed(runList)
-  const picked = Array.isArray(runsFound) ? pickRuns(runsFound as Record<string, unknown>[], Date.now()) : []
-  const jobs = await Promise.all(picked.map(r => gh('run', 'view', String(r.databaseId), '-R', slug, '--json', 'jobs')))
-  if (contextKey(repoContext) !== key) return
-  const runs: CiRun[] = picked.map((r, i) => {
-    const answer = parsed(jobs[i] as { run: ProcessRunResult } | { error: string }) as { jobs?: unknown } | null
-    return {
-      id: Number(r.databaseId),
-      workflow: String(r.workflowName ?? ''),
-      url: String(r.url ?? ''),
-      checks: jobChecks(answer?.jobs),
-      ...(r.status === 'completed' ? { doneAt: Date.parse(String(r.updatedAt)) } : {}),
+    if (f && f.reason !== extrasLogged) {
+      extrasLogged = f.reason
+      $.ui.log(`fleet-street: runs or milestone unavailable: ${f.reason}`)
     }
-  })
+    return undefined
+  }
+  const before = shown?.kind === 'ok' && sameRepo ? shown : null
+
+  const milestoneList = extra(milestones)
+  const milestone = Array.isArray(milestoneList)
+    ? pickMilestone(milestoneList as Record<string, unknown>[], milestoneName)
+    : (before?.milestone ?? null)
+  const runsFound = extra(runList)
+  const picked = Array.isArray(runsFound) ? pickRuns(runsFound as Record<string, unknown>[], Date.now()) : null
+  const jobs = await Promise.all((picked ?? []).map(r => gh('run', 'view', String(r.databaseId), '-R', slug, '--json', 'jobs')))
+  if (contextKey(repoContext) !== key) return
+  const runs: CiRun[] =
+    picked === null
+      ? (before?.runs ?? [])
+      : picked.map((r, i) => {
+          const id = Number(r.databaseId)
+          const answer = extra(jobs[i] as { run: ProcessRunResult } | { error: string }) as { jobs?: unknown } | undefined
+          return {
+            id,
+            workflow: String(r.workflowName ?? ''),
+            url: String(r.url ?? ''),
+            checks: answer ? jobChecks(answer.jobs) : (before?.runs?.find(x => x.id === id)?.checks ?? null),
+            ...(r.status === 'completed' ? { doneAt: Date.parse(String(r.updatedAt)) } : {}),
+          }
+        })
 
   const now = Date.now()
   if (failed === null) {
