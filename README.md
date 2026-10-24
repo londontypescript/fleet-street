@@ -25,12 +25,17 @@ Usage and Status Banner Plugin for Claude
     included (the lines of the first 200 new files), as `+152 −32`, and not shown when there's nothing. It
     compares with the merge-base of `HEAD` and `origin/<mainBranch>` (the local `<mainBranch>` when there's no
     such remote branch), as the refs stand locally: nothing is fetched
-  - Middle: `wt`, the repository's other worktrees that you made, each by its branch (by its folder when
+  - Middle: `ms`, the milestone being worked on, with a bar and a count of its issues closed out of all of
+    them (`0.2.0 ██░░░░ 3/22`). It's the one the `milestone` option names, else the open milestone with the
+    lowest version number (compared as versions, so `0.0.10` comes after `0.0.9`), else the open one made
+    first; not shown when the repository has no open milestone. Read with `pr`'s refresh and needs the same
+  - Middle, after it: `wt`, the repository's other worktrees that you made, each by its branch (by its folder when
     detached), shown only when there are some. Subagents' worktrees (`.claude/worktrees/agent-…`) are left out:
     their agents are on `ag`
   - Right: `time`, how long the session has been running
-  - When the row runs out of room, the worktrees are squeezed a step at a time (full names first, then cut to
-    24, then 12, then the first names and `+N`, then `×N`), then left out, then the diff is left out
+  - When the row runs out of room, the milestone's bar is left out, then the worktrees are squeezed a step at a
+    time (full names first, then cut to 24, then 12, then the first names and `+N`, then `×N`), then the
+    milestone is left out, then the worktrees, then the diff
 - **The list rows** below it each appear only while they have something to show, so a quiet session is two
   rows tall. Rows have a blank line between them while they all fit in the space the app gives the banner
   (at most half the terminal); when they wouldn't, they're packed tight. Each is a label and its entries; when a row runs out of room it is squeezed a step at a time, as
@@ -38,10 +43,6 @@ Usage and Status Banner Plugin for Claude
   out. The label stays on the left and the entries are spread in columns across the rest of the width, each
   centred in its own, with `│` between them; the spare width is shared evenly, so a longer entry gets a wider
   column.
-  - `ms`: the milestone being worked on, with its issues closed out of all of them (`0.2.0 3/22`). It's the
-    one the `milestone` option names, else the open milestone with the lowest version number (compared as
-    versions, so `0.0.10` comes after `0.0.9`), else the open one made first. No row when the repository has
-    no open milestone. Read with `pr`'s refresh and needs the same
   - `ag`: this session's subagents, from Claude Code's own agent list, each with its description, its model and
     effort (`Opus High`, `Sonnet Med`, from its first step), a mark (`●` running, `○` waiting or idle, `✓` done, `✗` failed) and how long it has run. A finished
     one stays for two minutes. Background runs of ChatGPT through the Codex CLI (`codex-locked`, `codex exec`)
@@ -104,7 +105,7 @@ Set in the plugin's config:
 | --- | --- | --- |
 | `awayMinutes` | `30` | Minutes without activity before the banner asks whether to keep the session timer going |
 | `mainBranch` | `main` | The branch shown in green; any other branch is shown in yellow |
-| `showWork` | `true` | Show the `ms`, `pr` and `ci` rows and the diff beside the branch |
+| `showWork` | `true` | Show the milestone and the diff beside the branch, and the `pr` and `ci` rows |
 | `showSessions` | `false` | Show the row of recent sessions |
 | `contextWarnTokens` | `300000` | Context size at which `ctx` turns yellow, whatever its percentage |
 | `contextHandoverTokens` | `450000` | Context size at which `ctx` turns red |

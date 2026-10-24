@@ -1503,8 +1503,9 @@ export const register: Register = (on, options) => {
           )
 
     // Row 2: the branch with its diff against the main branch beside it (`+152 −32`, uncommitted work included),
-    // the worktrees in the middle, and the session time on the right. When the row runs out of room the
-    // worktrees are squeezed a step at a time, then left out, then the diff is left out.
+    // the milestone and the worktrees in the middle, and the session time on the right. When the row runs out of
+    // room the milestone's bar is left out, then the worktrees are squeezed a step at a time, then the milestone
+    // is left out, then the worktrees, then the diff.
     const elapsed = started !== null ? fmtElapsed(t - started) : null
     const diffShown = workOn && diffState?.kind === 'ok' && !diffState.clean
     const diffNumbers = diffState?.kind === 'ok' ? [`+${diffState.added}`, `−${diffState.deleted}`] : []
@@ -1519,16 +1520,57 @@ export const register: Register = (on, options) => {
     const rightWidth: Width = { text: elapsed ? 4 + cells(elapsed) : 0, gaps: elapsed ? 1 : 0 }
     const columns = (w: Width) => Math.ceil(w.text * scale) + w.gaps
     const sideColumns = (diff: boolean) => Math.max(columns(leftWidth(diff)), columns(rightWidth))
-    const row2Fits = (diff: boolean, wt: Piece[] | null) => {
-      if (!wt) return columns(leftWidth(diff)) + 1 + columns(rightWidth) <= e.props.bodyColumns
-      const mid = piecesWidth('wt', wt)
+    // ms: the milestone being worked on, its title, a bar of its issues closed and the count (`0.2.0 ██░░░░ 3/22`).
+    const ms = workOn && prState?.kind === 'ok' ? (prState.milestone ?? null) : null
+    const msStale = prState?.kind === 'ok' && prState.stale
+    const msCount = ms ? `${ms.closed}/${ms.total}` : ''
+    type MsShape = 'bar' | 'bare' | null
+    const msWidth = (shape: MsShape): Width =>
+      !ms || !shape
+        ? { text: 0, gaps: 0 }
+        : shape === 'bar'
+          ? { text: 2 + cells(ms.title) + BAR_WIDTH + cells(msCount), gaps: 3 }
+          : { text: 2 + cells(ms.title) + cells(msCount), gaps: 2 }
+    // The middle: the milestone, then the worktrees two columns after it.
+    const midWidth = (shape: MsShape, wt: Piece[] | null): Width => {
+      const m = msWidth(shape)
+      if (!wt) return m
+      const w = piecesWidth('wt', wt)
+      return { text: m.text + w.text, gaps: m.gaps + w.gaps + (shape && ms ? 2 : 0) }
+    }
+    const row2Fits = (diff: boolean, shape: MsShape, wt: Piece[] | null) => {
+      if (!wt && !(shape && ms)) return columns(leftWidth(diff)) + 1 + columns(rightWidth) <= e.props.bodyColumns
+      const mid = midWidth(shape, wt)
       return 2 * sideColumns(diff) + 2 + mid.text * scale + mid.gaps <= e.props.bodyColumns
     }
+    const wtOrNone: (Piece[] | null)[] = wtLayouts.length > 0 ? wtLayouts : [null]
+    const msShapes: MsShape[] = ms ? ['bar', 'bare'] : []
     const row2Fit = [
-      ...wtLayouts.map(wt => ({ diff: diffShown, wt })),
-      { diff: diffShown, wt: null },
-      { diff: false, wt: null },
-    ].find(c => row2Fits(c.diff, c.wt)) ?? { diff: false, wt: null }
+      ...msShapes.slice(0, 1).map(shape => ({ diff: diffShown, ms: shape, wt: wtOrNone[0] ?? null })),
+      ...msShapes.slice(1).flatMap(shape => wtOrNone.map(wt => ({ diff: diffShown, ms: shape, wt }))),
+      ...wtLayouts.map(wt => ({ diff: diffShown, ms: null, wt })),
+      { diff: diffShown, ms: null, wt: null },
+      { diff: false, ms: null, wt: null },
+    ].find(c => row2Fits(c.diff, c.ms, c.wt)) ?? { diff: false, ms: null, wt: null }
+    const msFilled = ms ? filledCells(ms.total === 0 ? 0 : (ms.closed / ms.total) * 100) : 0
+    const msPart =
+      ms && row2Fit.ms ? (
+        <Box flexWrap="nowrap" columnGap={1}>
+          <Text bold>ms</Text>
+          <Text color="cyan" dimColor={msStale}>
+            {ms.title}
+          </Text>
+          {row2Fit.ms === 'bar' ? (
+            <Box>
+              <Text color="cyan" dimColor={msStale}>
+                {'█'.repeat(msFilled)}
+              </Text>
+              <Text color="gray">{'█'.repeat(BAR_WIDTH - msFilled)}</Text>
+            </Box>
+          ) : null}
+          <Text dimColor={msStale}>{msCount}</Text>
+        </Box>
+      ) : null
     const diffPart = row2Fit.diff ? (
       <Box flexWrap="nowrap" columnGap={1}>
         <Text color="green">{diffNumbers[0]}</Text>
@@ -1553,14 +1595,19 @@ export const register: Register = (on, options) => {
       </Box>
     ) : null
     const side = sideColumns(row2Fit.diff)
-    const statusLine = row2Fit.wt ? (
+    const statusLine = row2Fit.wt || msPart ? (
       <Box width="100%" flexWrap="nowrap" columnGap={1}>
         <Box width={side} flexShrink={0} flexWrap="nowrap">
           {branchPart}
         </Box>
-        <Box flexGrow={1} flexWrap="nowrap" justifyContent="center" columnGap={1}>
-          <Text bold>wt</Text>
-          {drawPieces(row2Fit.wt)}
+        <Box flexGrow={1} flexWrap="nowrap" justifyContent="center" columnGap={2}>
+          {msPart}
+          {row2Fit.wt ? (
+            <Box flexWrap="nowrap" alignItems="center" columnGap={1}>
+              <Text bold>wt</Text>
+              {drawPieces(row2Fit.wt)}
+            </Box>
+          ) : null}
         </Box>
         <Box width={side} flexShrink={0} flexWrap="nowrap" justifyContent="flex-end">
           {timePart}
@@ -1651,17 +1698,6 @@ export const register: Register = (on, options) => {
             ]),
           )
 
-    // ms: the milestone being worked on, with its issues closed out of all of them.
-    const ms = workOn && prState?.kind === 'ok' ? (prState.milestone ?? null) : null
-    const msLine = ms
-      ? fullLine(
-          listPart('ms', [
-            [{ key: 'ms', parts: [{ text: ms.title, color: 'cyan', dim: stale }, { text: `${ms.closed}/${ms.total}`, dim: stale }] }],
-            [{ key: 'ms', parts: [{ text: truncate(ms.title, 12), color: 'cyan', dim: stale }, { text: `${ms.closed}/${ms.total}`, dim: stale }] }],
-          ]),
-        )
-      : null
-
     // Recent sessions: three equal rounded cells spread edge to edge, each with its title and age
     // together in the middle. The terminal cuts a title to the cell's columns; a desktop draws a proportional
     // font narrower than its cells, so there the cell gets the whole title and clips only true overflow.
@@ -1697,7 +1733,7 @@ export const register: Register = (on, options) => {
         </Box>
       ) : null
 
-    if (!awayLine && !statusLine && !agLine && !bgLine && !prLine && !ciLine && !msLine && !recentLine) {
+    if (!awayLine && !statusLine && !agLine && !bgLine && !prLine && !ciLine && !recentLine) {
       return firstLine
     }
 
@@ -1705,7 +1741,7 @@ export const register: Register = (on, options) => {
     // so the list rows stay in view instead of scrolling behind the band's `n more`. Each row is one line but
     // the framed ones (the pr row while its titles are drawn, and the recent-sessions cells), which take
     // three; the blank lines go between rows.
-    const shown = [awayLine, statusLine, msLine, agLine, bgLine, prLine, ciLine, recentLine].filter(Boolean).length + 1
+    const shown = [awayLine, statusLine, agLine, bgLine, prLine, ciLine, recentLine].filter(Boolean).length + 1
     const height = shown + (prLine && prTall ? 2 : 0) + (recentLine && sessions !== null && sessions.length > 0 ? 2 : 0)
     const spacing = height + shown - 1 <= e.props.maxRows ? 1 : 0
 
@@ -1714,7 +1750,6 @@ export const register: Register = (on, options) => {
         {firstLine}
         {awayLine}
         {statusLine}
-        {msLine}
         {agLine}
         {bgLine}
         {prLine}

@@ -22,7 +22,7 @@
     "showWork": {
       "type": "boolean",
       "title": "Show PRs, runs, milestone and diff",
-      "description": "Show the milestone, open PRs (with their checks) and workflow runs rows, and the diff beside the branch against the expected branch",
+      "description": "Show the milestone and the diff on the branch row, and the rows of open PRs (with their checks) and workflow runs",
       "default": true
     },
     "showSessions": {
@@ -46,7 +46,7 @@
     "milestone": {
       "type": "string",
       "title": "Milestone",
-      "description": "The milestone the ms row follows, by its title; empty picks the open one with the lowest version",
+      "description": "The milestone shown on the branch row, by its title; empty picks the open one with the lowest version",
       "default": ""
     }
   }
