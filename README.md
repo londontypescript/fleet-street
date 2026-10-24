@@ -33,9 +33,9 @@ Usage and Status Banner Plugin for Claude
   rows tall. Rows have a blank line between them while they all fit in the space the app gives the banner
   (at most half the terminal); when they wouldn't, they're packed tight. Each is a label and its entries; when a row runs out of room it is squeezed a step at a time, as
   each row's entry says (full titles first), and on a row too narrow even for its last step the row is left
-  out. On `ag` and `bg` the label stays on the left and the entries are spread in even columns across the rest
-  of the width, each centred in its own; a squeezed `pr` row is spread across the full width, and one with room
-  to spare stays to the left.
+  out. The label stays on the left and the entries are spread in columns across the rest of the width, each
+  centred in its own, with `│` between them; the spare width is shared evenly, so a longer entry gets a wider
+  column.
   - `ag`: this session's subagents, from Claude Code's own agent list, each with its description, its model and
     effort (`Opus High`, `Sonnet Med`, from its first step), a mark (`●` running, `○` waiting or idle, `✓` done, `✗` failed) and how long it has run. A finished
     one stays for two minutes. Background runs of ChatGPT through the Codex CLI (`codex-locked`, `codex exec`)
