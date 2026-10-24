@@ -27,7 +27,7 @@ Usage and Status Banner Plugin for Claude
     such remote branch), as the refs stand locally: nothing is fetched
   - Middle: `ms`, the milestone being worked on, with a bar, a count of its issues closed out of all of them,
     and the headline of its description (`0.2.0 ██░░░░ 3/22 Agent rules and the merge loop`). The headline is
-    the description's words before its first colon, else its first sentence, with a footer after a `---` line
+    the description's words before its first colon and space (`: `), else its first sentence, with a footer after a `---` line
     left out. The milestone is the one the `milestone` option names, else the open milestone with the lowest
     version number (compared as versions, so `0.0.10` comes after `0.0.9`), else the open one made first; not
     shown when the repository has no open milestone. Clicking its title opens the milestone on GitHub. Read
@@ -58,7 +58,7 @@ Usage and Status Banner Plugin for Claude
     session's first; at most 10 branches are looked up). Each shows its number, its title and its checks as
     passed out of the total: `● 2/4` yellow while any are running, `✗ 3/4` red as soon as one fails, `✓ 4/4`
     green when all pass (skipped and neutral checks count as passed). The total includes the checks the PR's
-    base branch requires (by its rulesets or its branch protection, read every five minutes) that haven't
+    base branch requires (by its rulesets or its branch protection, asked for every five minutes; an answer that can't be refreshed counts for 30 minutes) that haven't
     reported yet; while any haven't and none failed or runs, it shows `○ 4/15` in yellow. A red `⚠` after the
     title means the PR conflicts with its base: GitHub doesn't start the workflows a `pull_request` event runs
     until the conflict is resolved, so those checks never come. A draft is dimmed. Clicking a title opens

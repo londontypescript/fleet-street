@@ -867,11 +867,15 @@ let prsFor = ''
 let prsLogged = ''
 let prsShown = ''
 let extrasLogged = ''
-// The checks each base branch requires, by repository and branch, and when they were read.
-const requiredKnown = new Map<string, { at: number; names: string[] }>()
+// The checks each base branch requires, by repository, branch and source (its rulesets, its classic
+// protection): the names last read, when they were read, and when they were last asked for. A source that
+// fails keeps its last answer until that is REQUIRED_KEEP_MS old; after that it counts for nothing.
+type Required = { names: string[]; readAt: number; askedAt: number }
+const requiredKnown = new Map<string, Required>()
+const REQUIRED_KEEP_MS = 30 * 60_000
 
-// The check names a ruleset (`rules/branches/<base>`) or classic branch protection (`branches/<base>`) requires.
-const requiredNames = (rules: unknown, branchInfo: unknown) => {
+// The check names a ruleset (`rules/branches/<base>`) requires.
+const rulesetNames = (rules: unknown) => {
   const names: string[] = []
   if (Array.isArray(rules)) {
     for (const r of rules as Record<string, unknown>[]) {
@@ -879,12 +883,17 @@ const requiredNames = (rules: unknown, branchInfo: unknown) => {
       if (Array.isArray(checks)) for (const c of checks as Record<string, unknown>[]) names.push(String(c.context ?? ''))
     }
   }
+  return names.filter(Boolean)
+}
+// The check names classic branch protection (`branches/<base>`) requires.
+const classicNames = (branchInfo: unknown) => {
   const classic = ((branchInfo as Record<string, unknown> | null)?.protection as Record<string, unknown> | undefined)?.required_status_checks as
     | Record<string, unknown>
     | undefined
+  const names: string[] = []
   if (Array.isArray(classic?.contexts)) names.push(...(classic.contexts as unknown[]).map(String))
   if (Array.isArray(classic?.checks)) names.push(...(classic.checks as Record<string, unknown>[]).map(c => String(c.context ?? '')))
-  return [...new Set(names.filter(Boolean))]
+  return names.filter(Boolean)
 }
 
 async function refreshPrs($: EngineInterface) {
@@ -1018,7 +1027,8 @@ async function scanPrs($: EngineInterface) {
   const before = shown?.kind === 'ok' && sameRepo ? shown : null
 
   // The checks each PR's base requires, so one whose workflows never started doesn't pass on the few that did.
-  // When GitHub can't say (no access to the rules, say), the PR's checks go by what reported, as before.
+  // Each source is asked every REQUIRED_MS, whether its last answer came or not. When neither has answered for
+  // REQUIRED_KEEP_MS (no access to the rules, say), the PR's checks go by what reported, as before.
   const parsed = (ran: { run: ProcessRunResult } | { error: string }): unknown => {
     if (classifyGh(slug, ran) !== null || !('run' in ran)) return undefined
     try {
@@ -1027,26 +1037,35 @@ async function scanPrs($: EngineInterface) {
       return undefined
     }
   }
-  const requiredKey = (base: string) => `${slug}\0${base}`
-  const due = [...new Set(found.map(p => p.base).filter(Boolean))].filter(b => Date.now() - (requiredKnown.get(requiredKey(b))?.at ?? 0) >= REQUIRED_MS)
+  const sources = [
+    { id: 'rules', path: (b: string) => `repos/${slug}/rules/branches/${encodeURIComponent(b)}`, names: rulesetNames },
+    { id: 'classic', path: (b: string) => `repos/${slug}/branches/${encodeURIComponent(b)}`, names: classicNames },
+  ]
+  const requiredKey = (base: string, source: string) => `${slug}\0${base}\0${source}`
+  const bases = [...new Set(found.map(p => p.base).filter(Boolean))]
   await Promise.all(
-    due.map(async b => {
-      const [rules, info] = await Promise.all([
-        gh('api', `repos/${slug}/rules/branches/${encodeURIComponent(b)}`),
-        gh('api', `repos/${slug}/branches/${encodeURIComponent(b)}`),
-      ])
-      const r = parsed(rules)
-      const i = parsed(info)
-      if (r === undefined && i === undefined) return
-      // Half an answer is used but not kept, so it's asked again next time.
-      requiredKnown.set(requiredKey(b), { at: r !== undefined && i !== undefined ? Date.now() : 0, names: requiredNames(r, i) })
-    }),
+    bases.flatMap(b =>
+      sources.map(async s => {
+        const k = requiredKey(b, s.id)
+        const known = requiredKnown.get(k)
+        if (known && Date.now() - known.askedAt < REQUIRED_MS) return
+        const askedAt = Date.now()
+        requiredKnown.set(k, { names: known?.names ?? [], readAt: known?.readAt ?? 0, askedAt })
+        const answer = parsed(await gh('api', s.path(b)))
+        if (answer !== undefined) requiredKnown.set(k, { names: s.names(answer), readAt: Date.now(), askedAt })
+      }),
+    ),
   )
   if (contextKey(repoContext) !== key) return
-  const prsFound: Pr[] = found.map(({ base, rollup, ...p }) => ({
-    ...p,
-    checks: summariseChecks(rollup, requiredKnown.get(requiredKey(base))?.names ?? []),
-  }))
+  const requiredFor = (base: string) => [
+    ...new Set(
+      sources.flatMap(s => {
+        const known = requiredKnown.get(requiredKey(base, s.id))
+        return known && Date.now() - known.readAt < REQUIRED_KEEP_MS ? known.names : []
+      }),
+    ),
+  ]
+  const prsFound: Pr[] = found.map(({ base, rollup, ...p }) => ({ ...p, checks: summariseChecks(rollup, requiredFor(base)) }))
 
   const milestoneList = extra(milestones)
   const milestone = Array.isArray(milestoneList)
