@@ -25,18 +25,16 @@ Usage and Status Banner Plugin for Claude
     included (the lines of the first 200 new files), as `+152 −32`, and not shown when there's nothing. It
     compares with the merge-base of `HEAD` and `origin/<mainBranch>` (the local `<mainBranch>` when there's no
     such remote branch), as the refs stand locally: nothing is fetched
-  - Middle: `ms`, the milestone being worked on, with a bar and a count of its issues closed out of all of
-    them (`0.2.0 ██░░░░ 3/22`). It's the one the `milestone` option names, else the open milestone with the
-    lowest version number (compared as versions, so `0.0.10` comes after `0.0.9`), else the open one made
-    first; not shown when the repository has no open milestone. Clicking its title opens the milestone on
-    GitHub. Read with `pr`'s refresh and needs the same
-  - Middle, after it: `wt`, the repository's other worktrees that you made, each by its branch (by its folder when
-    detached), shown only when there are some. Subagents' worktrees (`.claude/worktrees/agent-…`) are left out:
-    their agents are on `ag`
+  - Middle: `ms`, the milestone being worked on, with a bar, a count of its issues closed out of all of them,
+    and the headline of its description (`0.2.0 ██░░░░ 3/22 Agent rules and the merge loop`). The headline is
+    the description's words before its first colon, else its first sentence, with a footer after a `---` line
+    left out. The milestone is the one the `milestone` option names, else the open milestone with the lowest
+    version number (compared as versions, so `0.0.10` comes after `0.0.9`), else the open one made first; not
+    shown when the repository has no open milestone. Clicking its title opens the milestone on GitHub. Read
+    with `pr`'s refresh and needs the same
   - Right: `time`, how long the session has been running
-  - When the row runs out of room, the milestone's bar is left out, then the worktrees are squeezed a step at a
-    time (full names first, then cut to 24, then 12, then the first names and `+N`, then `×N`), then the
-    milestone is left out, then the worktrees, then the diff
+  - When the row runs out of room, the headline is cut to 32, then 16, then left out, then the milestone's bar
+    is left out, then the milestone, then the diff
 - **The list rows** below it each appear only while they have something to show, so a quiet session is two
   rows tall. Rows have a blank line between them while they all fit in the space the app gives the banner
   (at most half the terminal); when they wouldn't, they're packed tight. Each is a label and its entries; when a row runs out of room it is squeezed a step at a time, as
@@ -53,10 +51,17 @@ Usage and Status Banner Plugin for Claude
   - `bg`: the background shells and monitors, each by the description Claude gave its call (the title the
     app's task list shows; the command when there is none), with how long it has run. Squeezed: labels cut to
     32, then 16, then the first ones and `+N`, then `×N` with the oldest one's age
+  - `wt`: the repository's other worktrees that you made, each by its branch (by its folder when detached).
+    Subagents' worktrees (`.claude/worktrees/agent-…`) are left out: their agents are on `ag`. Squeezed: names
+    cut to 24, then 12, then the first ones and `+N`, then `×N`
   - `pr`: the open pull requests whose branch is this session's branch or one of the worktrees' (this
     session's first; at most 10 branches are looked up). Each shows its number, its title and its checks as
     passed out of the total: `● 2/4` yellow while any are running, `✗ 3/4` red as soon as one fails, `✓ 4/4`
-    green when all pass (skipped and neutral checks count as passed). A draft is dimmed. Clicking a title opens
+    green when all pass (skipped and neutral checks count as passed). The total includes the checks the PR's
+    base branch requires (by its rulesets or its branch protection, read every five minutes) that haven't
+    reported yet; while any haven't and none failed or runs, it shows `○ 4/15` in yellow. A red `⚠` after the
+    title means the PR conflicts with its base: GitHub doesn't start the workflows a `pull_request` event runs
+    until the conflict is resolved, so those checks never come. A draft is dimmed. Clicking a title opens
     the PR; it shows as a button on hover. PRs from forks are left out. It checks GitHub every 15 seconds
     while any checks are running, every 60 seconds otherwise, and at once when the branch or the worktrees
     change. It needs `gh`, signed in, and an `origin` remote on github.com; when `gh` can't answer there's no

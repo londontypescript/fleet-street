@@ -667,7 +667,9 @@ async function readDiff(git: Git): Promise<DiffState> {
 
 // PRs are looked up for at most this many branches: this session's, then the worktrees'.
 const PR_BRANCHES = 10
-const PR_FIELDS = 'number,title,url,headRefName,isDraft,isCrossRepository,statusCheckRollup'
+const PR_FIELDS = 'number,title,url,headRefName,baseRefName,isDraft,isCrossRepository,mergeable,statusCheckRollup'
+// The checks a base branch requires (its rulesets' and its classic protection's) are read again this often.
+const REQUIRED_MS = 5 * 60_000
 // While any shown PR has checks running, then once they've all finished, and after a rate-limit reply.
 const PR_FAST_MS = 15_000
 const PR_SLOW_MS = 60_000
@@ -693,8 +695,9 @@ const AGENT_MARKS: Record<Subagent['status'], { mark: string; color: string | un
 }
 // How each result is drawn, and which wins when a count stands for several PRs.
 const CHECK_MARKS: Record<Checks['state'], { mark: string; color: string | undefined; rank: number }> = {
-  fail: { mark: '✗', color: 'red', rank: 3 },
-  running: { mark: '●', color: 'yellow', rank: 2 },
+  fail: { mark: '✗', color: 'red', rank: 4 },
+  running: { mark: '●', color: 'yellow', rank: 3 },
+  waiting: { mark: '○', color: 'yellow', rank: 2 },
   unknown: { mark: '?', color: undefined, rank: 1 },
   pass: { mark: '✓', color: 'green', rank: 0 },
 }
@@ -722,9 +725,13 @@ const latestChecks = (rollup: Record<string, unknown>[]) => {
   return [...latest.values()]
 }
 
-const summariseChecks = (raw: unknown): Checks | null => {
-  if (!Array.isArray(raw) || raw.length === 0) return null
-  const rollup = latestChecks(raw as Record<string, unknown>[])
+// required: the check names the PR's base branch requires; those not reported yet count as missing, in the
+// total but not passed. A PR in conflict never gets them: the workflows a pull_request event starts don't run.
+const summariseChecks = (raw: unknown, required: string[] = []): Checks | null => {
+  const rollup = latestChecks(Array.isArray(raw) ? (raw as Record<string, unknown>[]) : [])
+  const reported = new Set(rollup.map(c => String(c.name ?? c.context ?? '')))
+  const missing = required.filter(r => !reported.has(r)).length
+  if (rollup.length === 0 && missing === 0) return null
   let passed = 0
   let failed = 0
   let running = 0
@@ -741,8 +748,8 @@ const summariseChecks = (raw: unknown): Checks | null => {
       failedNames.push(String(c.name ?? c.context ?? '').replace(/\s+/g, ' ').trim() || '?')
     } else unknown++
   }
-  const state = failed > 0 ? 'fail' : running > 0 ? 'running' : unknown > 0 ? 'unknown' : 'pass'
-  return { passed, total: rollup.length, state, running: running > 0, failed: failedNames }
+  const state = failed > 0 ? 'fail' : running > 0 ? 'running' : missing > 0 ? 'waiting' : unknown > 0 ? 'unknown' : 'pass'
+  return { passed, total: rollup.length + missing, state, running: running > 0, failed: failedNames, ...(missing > 0 ? { missing } : {}) }
 }
 
 // A run's jobs as `gh run view --json jobs` gives them (lower case), in the rollup's shape (upper case).
@@ -816,7 +823,23 @@ const pickMilestone = (list: Record<string, unknown>[], named: string): Mileston
     [...list].sort((a, b) => Number(a.number) - Number(b.number))[0]
   if (!chosen) return null
   const closed = Number(chosen.closed_issues ?? 0)
-  return { title: String(chosen.title), url: String(chosen.html_url ?? ''), closed, total: closed + Number(chosen.open_issues ?? 0) }
+  return {
+    title: String(chosen.title),
+    url: String(chosen.html_url ?? ''),
+    closed,
+    total: closed + Number(chosen.open_issues ?? 0),
+    headline: headlineOf(String(chosen.description ?? '')),
+  }
+}
+
+// A milestone's description cut to its headline: the words before its first colon (`Agent rules and the merge
+// loop: our AGENTS.md uses…`), else its first sentence. A footer after a `---` line is dropped first.
+const headlineOf = (description: string) => {
+  const body = description.split(/^\s*-{3,}\s*$/m)[0] ?? ''
+  const text = body.replace(/\s+/g, ' ').trim()
+  // A colon past the first sentence isn't the headline's.
+  const colon = /^(.+?):\s/.exec(text)?.[1]?.match(/^(?!.*[.!?]\s).*$/)?.[0]
+  return (colon ?? /^(.+?[.!?])(\s|$)/.exec(text)?.[1] ?? text).trim()
 }
 
 // Runs fn over the items, at most limit at once, keeping their order.
@@ -844,6 +867,25 @@ let prsFor = ''
 let prsLogged = ''
 let prsShown = ''
 let extrasLogged = ''
+// The checks each base branch requires, by repository and branch, and when they were read.
+const requiredKnown = new Map<string, { at: number; names: string[] }>()
+
+// The check names a ruleset (`rules/branches/<base>`) or classic branch protection (`branches/<base>`) requires.
+const requiredNames = (rules: unknown, branchInfo: unknown) => {
+  const names: string[] = []
+  if (Array.isArray(rules)) {
+    for (const r of rules as Record<string, unknown>[]) {
+      const checks = r.type === 'required_status_checks' ? (r.parameters as Record<string, unknown> | null)?.required_status_checks : null
+      if (Array.isArray(checks)) for (const c of checks as Record<string, unknown>[]) names.push(String(c.context ?? ''))
+    }
+  }
+  const classic = ((branchInfo as Record<string, unknown> | null)?.protection as Record<string, unknown> | undefined)?.required_status_checks as
+    | Record<string, unknown>
+    | undefined
+  if (Array.isArray(classic?.contexts)) names.push(...(classic.contexts as unknown[]).map(String))
+  if (Array.isArray(classic?.checks)) names.push(...(classic.checks as Record<string, unknown>[]).map(c => String(c.context ?? '')))
+  return [...new Set(names.filter(Boolean))]
+}
 
 async function refreshPrs($: EngineInterface) {
   if (prsRunning) {
@@ -926,7 +968,7 @@ async function scanPrs($: EngineInterface) {
   // The repository or branches changed while gh ran; the refresh that change asked for follows.
   if (contextKey(repoContext) !== key) return
 
-  const found: Pr[] = []
+  const found: (Pr & { base: string; rollup: unknown })[] = []
   let failed: PrFail | null = null
   // An unavailable answer outranks a rate limit, which outranks a passing failure.
   const rank = { unavailable: 3, rate: 2, stale: 1 }
@@ -944,7 +986,10 @@ async function scanPrs($: EngineInterface) {
             url: String(p.url ?? ''),
             branch: branchName,
             draft: Boolean(p.isDraft),
-            checks: summariseChecks(p.statusCheckRollup),
+            conflict: p.mergeable === 'CONFLICTING',
+            checks: null,
+            base: String(p.baseRefName ?? ''),
+            rollup: p.statusCheckRollup,
           })
         }
       } catch {
@@ -971,6 +1016,37 @@ async function scanPrs($: EngineInterface) {
     return undefined
   }
   const before = shown?.kind === 'ok' && sameRepo ? shown : null
+
+  // The checks each PR's base requires, so one whose workflows never started doesn't pass on the few that did.
+  // When GitHub can't say (no access to the rules, say), the PR's checks go by what reported, as before.
+  const parsed = (ran: { run: ProcessRunResult } | { error: string }): unknown => {
+    if (classifyGh(slug, ran) !== null || !('run' in ran)) return undefined
+    try {
+      return JSON.parse(ran.run.stdout)
+    } catch {
+      return undefined
+    }
+  }
+  const requiredKey = (base: string) => `${slug}\0${base}`
+  const due = [...new Set(found.map(p => p.base).filter(Boolean))].filter(b => Date.now() - (requiredKnown.get(requiredKey(b))?.at ?? 0) >= REQUIRED_MS)
+  await Promise.all(
+    due.map(async b => {
+      const [rules, info] = await Promise.all([
+        gh('api', `repos/${slug}/rules/branches/${encodeURIComponent(b)}`),
+        gh('api', `repos/${slug}/branches/${encodeURIComponent(b)}`),
+      ])
+      const r = parsed(rules)
+      const i = parsed(info)
+      if (r === undefined && i === undefined) return
+      // Half an answer is used but not kept, so it's asked again next time.
+      requiredKnown.set(requiredKey(b), { at: r !== undefined && i !== undefined ? Date.now() : 0, names: requiredNames(r, i) })
+    }),
+  )
+  if (contextKey(repoContext) !== key) return
+  const prsFound: Pr[] = found.map(({ base, rollup, ...p }) => ({
+    ...p,
+    checks: summariseChecks(rollup, requiredKnown.get(requiredKey(base))?.names ?? []),
+  }))
 
   const milestoneList = extra(milestones)
   const milestone = Array.isArray(milestoneList)
@@ -1002,9 +1078,9 @@ async function scanPrs($: EngineInterface) {
   const now = Date.now()
   if (failed === null) {
     prsLogged = ''
-    const running = found.some(p => p.checks?.running) || runs.some(r => r.doneAt === undefined)
+    const running = prsFound.some(p => p.checks?.running) || runs.some(r => r.doneAt === undefined)
     prsDueAt = now + (running ? PR_FAST_MS : PR_SLOW_MS)
-    await setPrs($, { kind: 'ok', prs: found, runs, milestone, stale: false })
+    await setPrs($, { kind: 'ok', prs: prsFound, runs, milestone, stale: false })
     return
   }
   if (failed.reason !== prsLogged) {
@@ -1330,7 +1406,7 @@ export const register: Register = (on, options) => {
     type Width = { text: number; gaps: number }
     const fits = (w: Width) => w.text * scale + w.gaps <= e.props.bodyColumns
 
-    // The list rows (ag, bg, pr) are drawn only when they have something. Each is a label and its entries,
+    // The list rows (ag, bg, wt, pr, ci) are drawn only when they have something. Each is a label and its entries,
     // squeezed one step at a time until the row fits, and left out when even the last step doesn't.
     type Part = { text: string; color?: string; dim?: boolean; press?: () => void }
     type Piece = { key: string; parts: Part[] }
@@ -1397,8 +1473,8 @@ export const register: Register = (on, options) => {
         </Box>
       ) : null
 
-    // wt: the worktrees made by hand, in the middle of row 2. Subagents' worktrees are left out: their agents
-    // are on the ag row.
+    // wt: the worktrees made by hand, each by its branch. Subagents' worktrees are left out: their agents are on
+    // the ag row.
     const ownTrees = trees.filter(w => !w.agent)
     const treePiece = (w: Worktree, max: number): Piece => ({
       key: w.path,
@@ -1417,6 +1493,7 @@ export const register: Register = (on, options) => {
             ),
             [countPiece(ownTrees.length, 'cyan')],
           ]
+    const wtLine = wtLayouts.length === 0 ? null : fullLine(listPart('wt', wtLayouts))
 
     // ag: the subagents, and the background runs of another provider's agent (ChatGPT Sol through Codex), each
     // with its description, model and effort, a mark for where it stands, and how long it has run.
@@ -1493,16 +1570,15 @@ export const register: Register = (on, options) => {
           )
 
     // Row 2: the branch with its diff against the main branch beside it (`+152 −32`, uncommitted work included),
-    // the milestone and the worktrees in the middle, and the session time on the right. When the row runs out of
-    // room the milestone's bar is left out, then the worktrees are squeezed a step at a time, then the milestone
-    // is left out, then the worktrees, then the diff.
+    // the milestone in the middle, and the session time on the right. When the row runs out of room the
+    // milestone's headline is cut, then left out, then its bar, then the milestone, then the diff.
     const elapsed = started !== null ? fmtElapsed(t - started) : null
     const diffShown = workOn && diffState?.kind === 'ok' && !diffState.clean
     const diffNumbers = diffState?.kind === 'ok' ? [`+${diffState.added}`, `−${diffState.deleted}`] : []
     const branchText = onBranch ? `⎇ ${onBranch}` : ''
-    // The branch, and with the diff two columns and the two numbers a column apart; `time 26m`. With worktrees in
-    // the middle both sides take the wider one's columns, so the middle sits at the true centre: two sides, a
-    // column either side of the middle, and the wt part.
+    // The branch, and with the diff two columns and the two numbers a column apart; `time 26m`. With the
+    // milestone in the middle both sides take the wider one's columns, so the middle sits at the true centre: two
+    // sides, a column either side of the middle, and the milestone.
     const leftWidth = (diff: boolean): Width => ({
       text: cells(branchText) + (diff ? diffNumbers.reduce((w, x) => w + cells(x), 0) : 0),
       gaps: diff ? 1 + (onBranch ? 2 : 0) : 0,
@@ -1510,39 +1586,40 @@ export const register: Register = (on, options) => {
     const rightWidth: Width = { text: elapsed ? 4 + cells(elapsed) : 0, gaps: elapsed ? 1 : 0 }
     const columns = (w: Width) => Math.ceil(w.text * scale) + w.gaps
     const sideColumns = (diff: boolean) => Math.max(columns(leftWidth(diff)), columns(rightWidth))
-    // ms: the milestone being worked on, its title, a bar of its issues closed and the count (`0.2.0 ██░░░░ 3/22`).
-    // Clicking the title opens the milestone on GitHub.
+    // ms: the milestone being worked on, its title, a bar of its issues closed, the count and the headline of its
+    // description (`0.2.0 ██░░░░ 3/22 Agent rules and the merge loop`). Clicking the title opens it on GitHub.
     const ms = workOn && prState?.kind === 'ok' ? (prState.milestone ?? null) : null
     const msStale = prState?.kind === 'ok' && prState.stale
     const msCount = ms ? `${ms.closed}/${ms.total}` : ''
-    type MsShape = 'bar' | 'bare' | null
-    const msWidth = (shape: MsShape): Width =>
-      !ms || !shape
-        ? { text: 0, gaps: 0 }
-        : shape === 'bar'
-          ? { text: 2 + cells(ms.title) + BAR_WIDTH + cells(msCount), gaps: 3 }
-          : { text: 2 + cells(ms.title) + cells(msCount), gaps: 2 }
-    // The middle: the milestone, then the worktrees two columns after it.
-    const midWidth = (shape: MsShape, wt: Piece[] | null): Width => {
-      const m = msWidth(shape)
-      if (!wt) return m
-      const w = piecesWidth('wt', wt)
-      return { text: m.text + w.text, gaps: m.gaps + w.gaps + (shape && ms ? 2 : 0) }
+    const headline = ms?.headline ?? ''
+    // How much of the milestone is drawn: with or without its bar, and its headline cut to so many cells (0: none).
+    type MsShape = { bar: boolean; headline: number } | null
+    const headlineText = (shape: MsShape) => (shape && shape.headline > 0 ? truncate(headline, shape.headline) : '')
+    const msWidth = (shape: MsShape): Width => {
+      if (!ms || !shape) return { text: 0, gaps: 0 }
+      const h = headlineText(shape)
+      return {
+        text: 2 + cells(ms.title) + (shape.bar ? BAR_WIDTH : 0) + cells(msCount) + cells(h),
+        gaps: 2 + (shape.bar ? 1 : 0) + (h ? 1 : 0),
+      }
     }
-    const row2Fits = (diff: boolean, shape: MsShape, wt: Piece[] | null) => {
-      if (!wt && !(shape && ms)) return columns(leftWidth(diff)) + 1 + columns(rightWidth) <= e.props.bodyColumns
-      const mid = midWidth(shape, wt)
+    const row2Fits = (diff: boolean, shape: MsShape) => {
+      if (!(shape && ms)) return columns(leftWidth(diff)) + 1 + columns(rightWidth) <= e.props.bodyColumns
+      const mid = msWidth(shape)
       return 2 * sideColumns(diff) + 2 + mid.text * scale + mid.gaps <= e.props.bodyColumns
     }
-    const wtOrNone: (Piece[] | null)[] = wtLayouts.length > 0 ? wtLayouts : [null]
-    const msShapes: MsShape[] = ms ? ['bar', 'bare'] : []
+    const msShapes: MsShape[] = ms
+      ? [
+          ...(headline ? [Infinity, 32, 16].map(h => ({ bar: true, headline: h })) : []),
+          { bar: true, headline: 0 },
+          { bar: false, headline: 0 },
+        ]
+      : []
     const row2Fit = [
-      ...msShapes.slice(0, 1).map(shape => ({ diff: diffShown, ms: shape, wt: wtOrNone[0] ?? null })),
-      ...msShapes.slice(1).flatMap(shape => wtOrNone.map(wt => ({ diff: diffShown, ms: shape, wt }))),
-      ...wtLayouts.map(wt => ({ diff: diffShown, ms: null, wt })),
-      { diff: diffShown, ms: null, wt: null },
-      { diff: false, ms: null, wt: null },
-    ].find(c => row2Fits(c.diff, c.ms, c.wt)) ?? { diff: false, ms: null, wt: null }
+      ...msShapes.map(shape => ({ diff: diffShown, ms: shape })),
+      { diff: diffShown, ms: null },
+      { diff: false, ms: null },
+    ].find(c => row2Fits(c.diff, c.ms)) ?? { diff: false, ms: null }
     const msFilled = ms ? filledCells(ms.total === 0 ? 0 : (ms.closed / ms.total) * 100) : 0
     const msPart =
       ms && row2Fit.ms ? (
@@ -1553,7 +1630,7 @@ export const register: Register = (on, options) => {
               {ms.title}
             </Text>
           </Button>
-          {row2Fit.ms === 'bar' ? (
+          {row2Fit.ms.bar ? (
             <Box>
               <Text color="cyan" dimColor={msStale}>
                 {'█'.repeat(msFilled)}
@@ -1562,6 +1639,7 @@ export const register: Register = (on, options) => {
             </Box>
           ) : null}
           <Text dimColor={msStale}>{msCount}</Text>
+          {headlineText(row2Fit.ms) ? <Text dimColor={msStale}>{headlineText(row2Fit.ms)}</Text> : null}
         </Box>
       ) : null
     const diffPart = row2Fit.diff ? (
@@ -1588,19 +1666,13 @@ export const register: Register = (on, options) => {
       </Box>
     ) : null
     const side = sideColumns(row2Fit.diff)
-    const statusLine = row2Fit.wt || msPart ? (
+    const statusLine = msPart ? (
       <Box width="100%" flexWrap="nowrap" columnGap={1}>
         <Box width={side} flexShrink={0} flexWrap="nowrap">
           {branchPart}
         </Box>
-        <Box flexGrow={1} flexWrap="nowrap" justifyContent="center" columnGap={2}>
+        <Box flexGrow={1} flexWrap="nowrap" justifyContent="center">
           {msPart}
-          {row2Fit.wt ? (
-            <Box flexWrap="nowrap" alignItems="center" columnGap={1}>
-              <Text bold>wt</Text>
-              {drawPieces(row2Fit.wt)}
-            </Box>
-          ) : null}
         </Box>
         <Box width={side} flexShrink={0} flexWrap="nowrap" justifyContent="flex-end">
           {timePart}
@@ -1647,9 +1719,15 @@ export const register: Register = (on, options) => {
           ]
         : []
     }
+    // A PR in conflict with its base is marked ⚠: its pull_request workflows won't run until that's resolved.
+    const conflictPart: Part = { text: '⚠', color: stale ? undefined : 'red', dim: stale }
     const prPiece = (p: Pr, max: number | null, names = 0): Piece => ({
       key: `pr:${p.number}`,
-      parts: [{ text: prLabel(p, max), dim: p.draft || stale, press: () => openUrl($, p.url) }, ...resultParts(p.checks, names, 16)],
+      parts: [
+        { text: prLabel(p, max), dim: p.draft || stale, press: () => openUrl($, p.url) },
+        ...(p.conflict ? [conflictPart] : []),
+        ...resultParts(p.checks, names, 16),
+      ],
     })
     const worstCheck = prList.reduce<Checks['state'] | null>(
       (w, p) => (p.checks && (w === null || CHECK_MARKS[p.checks.state].rank > CHECK_MARKS[w].rank) ? p.checks.state : w),
@@ -1661,7 +1739,14 @@ export const register: Register = (on, options) => {
       prList.map(p => prPiece(p, 32)),
       prList.map(p => prPiece(p, 16)),
       prList.map(p => prPiece(p, null)),
-      [countPiece(prList.length, undefined, ...(worstCheck ? [checksPart(worstCheck, CHECK_MARKS[worstCheck].mark)] : []))],
+      [
+        countPiece(
+          prList.length,
+          undefined,
+          ...(prList.some(p => p.conflict) ? [conflictPart] : []),
+          ...(worstCheck ? [checksPart(worstCheck, CHECK_MARKS[worstCheck].mark)] : []),
+        ),
+      ],
     ]
     const prLine = prList.length === 0 ? null : fullLine(listPart('pr', prLayouts))
 
@@ -1724,14 +1809,14 @@ export const register: Register = (on, options) => {
         </Box>
       ) : null
 
-    if (!awayLine && !statusLine && !agLine && !bgLine && !prLine && !ciLine && !recentLine) {
+    if (!awayLine && !statusLine && !agLine && !bgLine && !wtLine && !prLine && !ciLine && !recentLine) {
       return firstLine
     }
 
     // A blank line between rows while they all fit in the rows the band may take; packed tight when they don't,
     // so the list rows stay in view instead of scrolling behind the band's `n more`. Each row is one line but
     // the recent-sessions cells, which take three; the blank lines go between rows.
-    const shown = [awayLine, statusLine, agLine, bgLine, prLine, ciLine, recentLine].filter(Boolean).length + 1
+    const shown = [awayLine, statusLine, agLine, bgLine, wtLine, prLine, ciLine, recentLine].filter(Boolean).length + 1
     const height = shown + (recentLine && sessions !== null && sessions.length > 0 ? 2 : 0)
     const spacing = height + shown - 1 <= e.props.maxRows ? 1 : 0
 
@@ -1742,6 +1827,7 @@ export const register: Register = (on, options) => {
         {statusLine}
         {agLine}
         {bgLine}
+        {wtLine}
         {prLine}
         {ciLine}
         {recentLine}
