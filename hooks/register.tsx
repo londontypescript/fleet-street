@@ -113,7 +113,7 @@ async function setBgTasks($: EngineInterface, fn: (list: BgTask[]) => BgTask[]) 
 // A task-notification names its task as <task-id>…</task-id>.
 async function endTasksIn($: EngineInterface, text: string) {
   if (bgCount === 0 || !text.includes('<task-notification')) return
-  const ids = new Set([...text.matchAll(/<task-id>([^<]+)<\/task-id>/g)].map(m => m[1].trim()))
+  const ids = new Set([...text.matchAll(/<task-id>([^<]+)<\/task-id>/g)].flatMap(m => (m[1] ? [m[1].trim()] : [])))
   if (ids.size > 0) await setBgTasks($, list => list.filter(b => !ids.has(b.id)))
 }
 
@@ -1237,9 +1237,26 @@ export const register: Register = (on, options) => {
       })
     // The first layout that fits. A squeezed row is nearly full, so its entries are spread across the width to
     // even out what's left; one with room to spare stays to the left. The label stays with the first entry.
-    const listPart = (label: string, layouts: Piece[][]) => {
+    // A row in columns keeps its label on the left and gives each entry an equal share of what's left of the
+    // width, centred in it, with the │ between them.
+    const listPart = (label: string, layouts: Piece[][], inColumns = false) => {
       const fit = layouts.find(ps => fits(piecesWidth(label, ps)))
       if (!fit) return null
+      if (inColumns) {
+        return (
+          <Box width="100%" flexWrap="nowrap" alignItems="center" columnGap={1}>
+            <Text bold>{label}</Text>
+            {fit.flatMap((p, i) => {
+              const column = (
+                <Box key={`c:${p.key}`} flexGrow={1} flexWrap="nowrap" justifyContent="center">
+                  {drawPieces([p])}
+                </Box>
+              )
+              return i === 0 ? [column] : [sep, column]
+            })}
+          </Box>
+        )
+      }
       const squeezed = fit !== layouts[0]
       const [first, ...rest] = drawPieces(fit)
       return (
@@ -1342,7 +1359,7 @@ export const register: Register = (on, options) => {
                 parts: [{ text: `${model} ×${list.length}`, color: MODEL_COLOR }, markPart(worstOf(list))],
               })),
               [countPiece(acts.length, undefined, markPart(worstOf(acts)))],
-            ]),
+            ], true),
           )
 
     // bg: background shells and monitors, by the description their call gave, with how long each has run.
@@ -1367,7 +1384,7 @@ export const register: Register = (on, options) => {
                 hidden => ({ key: 'more', parts: [{ text: `+${hidden.length}`, color: 'magenta' }] }),
               ),
               [countPiece(plain.length, 'magenta', { text: span(t - Math.min(...plain.map(b => b.startedAt))), dim: true })],
-            ]),
+            ], true),
           )
 
     // Row 2: the branch with its diff against the main branch beside it (`+152 −32`, uncommitted work included),
