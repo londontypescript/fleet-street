@@ -974,7 +974,7 @@ async function fetchShared<T>($: EngineInterface, path: string, fetch: (before: 
   if (got.failure.kind === 'rate') {
     await $.fs.write(await backoffFile($), JSON.stringify({ until: Date.now() + PR_BACKOFF_MS })).catch(() => {})
   }
-  if (newer || now.at > started) return
+  if (newer) return
   await writeShared($, path, { ...now, failedAt: Date.now(), failure: got.failure })
 }
 
