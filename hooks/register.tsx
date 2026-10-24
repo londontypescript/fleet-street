@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ProcessRunResult, Register, RenderChildren } from 'claude-code'
 
-import type { Away, BgTask, Checks, Context, DiffState, Limit, Pr, PrState, RecentSession, Subagent, Worktree } from '../types'
+import type { Away, BgTask, Checks, CiRun, Context, DiffState, Limit, Milestone, Pr, PrState, RecentSession, Subagent, Worktree } from '../types'
 
 const limits = atom({ plugin: 'fleet-street', key: 'limits' } as const, [] as Limit[])
 const context = atom({ plugin: 'fleet-street', key: 'context' } as const, null as Context | null)
@@ -74,6 +74,10 @@ const fmtElapsed = (ms: number) => {
 }
 
 const levelColor = (pct: number) => (pct >= 90 ? 'red' : pct >= 70 ? 'yellow' : 'green')
+// The context is coloured by the worse of its percentage and its size: on a large window a session is worth
+// handing over long before the percentage looks high.
+const contextColor = (pct: number, tokens: number, warn: number, handover: number) =>
+  levelColor(pct) === 'red' || tokens >= handover ? 'red' : levelColor(pct) === 'yellow' || tokens >= warn ? 'yellow' : 'green'
 
 // Both halves use the same full block so they line up; the empty part is just drawn grey.
 const BAR_WIDTH = 6
@@ -476,6 +480,8 @@ const openSession = async ($: EngineInterface, link: string) => {
 
 // Set from the options when the session starts.
 let mainBranchName = 'main'
+// The milestone the ms row follows, by its title; empty to pick one.
+let milestoneName = ''
 let workVisible = true
 
 const ok = (r: ProcessRunResult | null): r is ProcessRunResult => r !== null && r.exitCode === 0
@@ -723,17 +729,82 @@ const summariseChecks = (raw: unknown): Checks | null => {
   let failed = 0
   let running = 0
   let unknown = 0
+  const failedNames: string[] = []
   for (const c of rollup) {
     const legacy = c.__typename === 'StatusContext' || (c.status === undefined && typeof c.state === 'string')
     const done = legacy ? c.state !== 'PENDING' && c.state !== 'EXPECTED' : c.status === 'COMPLETED'
     const result = String((legacy ? c.state : c.conclusion) ?? '')
     if (!done && (legacy || typeof c.status === 'string')) running++
     else if (CHECK_PASSED.has(result)) passed++
-    else if (CHECK_FAILED.has(result)) failed++
-    else unknown++
+    else if (CHECK_FAILED.has(result)) {
+      failed++
+      failedNames.push(String(c.name ?? c.context ?? '').replace(/\s+/g, ' ').trim() || '?')
+    } else unknown++
   }
   const state = failed > 0 ? 'fail' : running > 0 ? 'running' : unknown > 0 ? 'unknown' : 'pass'
-  return { passed, total: rollup.length, state, running: running > 0 }
+  return { passed, total: rollup.length, state, running: running > 0, failed: failedNames }
+}
+
+// A run's jobs as `gh run view --json jobs` gives them (lower case), in the rollup's shape (upper case).
+const jobChecks = (raw: unknown): Checks | null =>
+  Array.isArray(raw)
+    ? summariseChecks(
+        (raw as Record<string, unknown>[]).map(j => ({
+          name: j.name,
+          status: String(j.status ?? '').toUpperCase(),
+          conclusion: String(j.conclusion ?? '').toUpperCase(),
+          startedAt: j.startedAt,
+          completedAt: j.completedAt,
+        })),
+      )
+    : null
+
+// The runs on the ci row: those a push, a dispatch, a release or a schedule started (a PR's are on its own
+// row; CodeQL's and issue triggers' are noise). Only each workflow's latest, while running and for a while
+// after it finishes, at most this many.
+const CI_EVENTS = new Set(['push', 'workflow_dispatch', 'release', 'schedule', 'merge_group', 'repository_dispatch'])
+const CI_RUNS = 3
+const CI_DONE_MS = 10 * 60_000
+const RUN_FIELDS = 'databaseId,workflowName,event,status,conclusion,url,updatedAt'
+
+const pickRuns = (list: Record<string, unknown>[], t: number) => {
+  const picked: Record<string, unknown>[] = []
+  const seen = new Set<string>()
+  // gh lists the newest first.
+  for (const r of list) {
+    const workflow = String(r.workflowName ?? '')
+    if (!CI_EVENTS.has(String(r.event)) || r.conclusion === 'skipped' || seen.has(workflow)) continue
+    seen.add(workflow)
+    if (r.status === 'completed' && t - Date.parse(String(r.updatedAt)) >= CI_DONE_MS) continue
+    picked.push(r)
+  }
+  return picked.slice(0, CI_RUNS)
+}
+
+// A version-like title (0.2.0, v1.4) as numbers to compare by; null when it isn't one.
+const versionOf = (title: string) => {
+  const m = /^v?(\d+(?:\.\d+)*)/i.exec(title.trim())
+  return m?.[1] ? m[1].split('.').map(Number) : null
+}
+const compareVersions = (a: number[], b: number[]) => {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const d = (a[i] ?? 0) - (b[i] ?? 0)
+    if (d !== 0) return d
+  }
+  return 0
+}
+// The milestone being worked on: the one the `milestone` option names, else the open one with the lowest
+// version, else the open one made first. Null when the repository has none open.
+const pickMilestone = (list: Record<string, unknown>[], named: string): Milestone | null => {
+  const chosen =
+    list.find(m => named !== '' && m.title === named) ??
+    list
+      .filter(m => versionOf(String(m.title)) !== null)
+      .sort((a, b) => compareVersions(versionOf(String(a.title)) ?? [], versionOf(String(b.title)) ?? []))[0] ??
+    [...list].sort((a, b) => Number(a.number) - Number(b.number))[0]
+  if (!chosen) return null
+  const closed = Number(chosen.closed_issues ?? 0)
+  return { title: String(chosen.title), url: String(chosen.html_url ?? ''), closed, total: closed + Number(chosen.open_issues ?? 0) }
 }
 
 // Runs fn over the items, at most limit at once, keeping their order.
@@ -829,15 +900,15 @@ async function scanPrs($: EngineInterface) {
     await setPrs($, { kind: 'loading' })
   }
 
-  const answers = await mapLimit(ctx.branches, 4, b =>
+  const gh = (...args: string[]) =>
     $.process
-      .run(['gh', 'pr', 'list', '-R', slug, '--head', b, '--state', 'open', '--limit', '20', '--json', PR_FIELDS], {
-        cwd: ctx.top,
-        timeoutMs: 15_000,
-        env: { GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' },
-      })
-      .then(run => ({ run }), err => ({ error: String(err) })),
-  )
+      .run(['gh', ...args], { cwd: ctx.top, timeoutMs: 15_000, env: { GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' } })
+      .then(run => ({ run }), err => ({ error: String(err) }))
+  const [answers, milestones, runList] = await Promise.all([
+    mapLimit(ctx.branches, 4, b => gh('pr', 'list', '-R', slug, '--head', b, '--state', 'open', '--limit', '20', '--json', PR_FIELDS)),
+    gh('api', `repos/${slug}/milestones?state=open&per_page=100`),
+    gh('run', 'list', '-R', slug, '--limit', '30', '--json', RUN_FIELDS),
+  ])
   // The repository or branches changed while gh ran; the refresh that change asked for follows.
   if (contextKey(repoContext) !== key) return
 
@@ -868,12 +939,43 @@ async function scanPrs($: EngineInterface) {
     }
     if (f && (!failed || rank[f.kind] > rank[failed.kind])) failed = f
   }
+  // Reads one more gh answer as JSON, or counts it among the failures.
+  const parsed = (ran: { run: ProcessRunResult } | { error: string }): unknown => {
+    let f = classifyGh(slug, ran)
+    if (f === null && 'run' in ran) {
+      try {
+        return JSON.parse(ran.run.stdout)
+      } catch {
+        f = { kind: 'stale', reason: 'gh gave an unreadable reply' }
+      }
+    }
+    if (f && (!failed || rank[f.kind] > rank[failed.kind])) failed = f
+    return null
+  }
+
+  const milestoneList = parsed(milestones)
+  const milestone = Array.isArray(milestoneList) ? pickMilestone(milestoneList as Record<string, unknown>[], milestoneName) : null
+  const runsFound = parsed(runList)
+  const picked = Array.isArray(runsFound) ? pickRuns(runsFound as Record<string, unknown>[], Date.now()) : []
+  const jobs = await Promise.all(picked.map(r => gh('run', 'view', String(r.databaseId), '-R', slug, '--json', 'jobs')))
+  if (contextKey(repoContext) !== key) return
+  const runs: CiRun[] = picked.map((r, i) => {
+    const answer = parsed(jobs[i] as { run: ProcessRunResult } | { error: string }) as { jobs?: unknown } | null
+    return {
+      id: Number(r.databaseId),
+      workflow: String(r.workflowName ?? ''),
+      url: String(r.url ?? ''),
+      checks: jobChecks(answer?.jobs),
+      ...(r.status === 'completed' ? { doneAt: Date.parse(String(r.updatedAt)) } : {}),
+    }
+  })
 
   const now = Date.now()
   if (failed === null) {
     prsLogged = ''
-    prsDueAt = now + (found.some(p => p.checks?.running) ? PR_FAST_MS : PR_SLOW_MS)
-    await setPrs($, { kind: 'ok', prs: found, stale: false })
+    const running = found.some(p => p.checks?.running) || runs.some(r => r.doneAt === undefined)
+    prsDueAt = now + (running ? PR_FAST_MS : PR_SLOW_MS)
+    await setPrs($, { kind: 'ok', prs: found, runs, milestone, stale: false })
     return
   }
   if (failed.reason !== prsLogged) {
@@ -910,6 +1012,9 @@ export const register: Register = (on, options) => {
   const workOn = options.showWork !== false
   workVisible = workOn
   mainBranchName = mainBranch
+  milestoneName = String(options.milestone ?? '').trim()
+  const contextWarn = Number(options.contextWarnTokens ?? 300_000)
+  const contextHandover = Number(options.contextHandoverTokens ?? 450_000)
   // Mirrors of state the timer needs, so it can decide whether a redraw would change anything.
   let lastAt: number | null = null
   let ttl = TTL_API_MS
@@ -1131,13 +1236,14 @@ export const register: Register = (on, options) => {
 
     if (ctx) {
       const pct = ctx.percent ?? 0
+      const color = contextColor(pct, ctx.tokens ?? 0, contextWarn, contextHandover)
       parts.push(
         <Box columnGap={1}>
           <Text bold>ctx</Text>
-          <Text color={levelColor(pct)}>
+          <Text color={color}>
             {fmtTokens(ctx.tokens ?? 0)}/{fmtTokens(ctx.window)}
           </Text>
-          <Text color={levelColor(pct)}>{pct}%</Text>
+          <Text color={color}>{pct}%</Text>
         </Box>,
       )
     }
@@ -1447,19 +1553,39 @@ export const register: Register = (on, options) => {
       color: stale ? undefined : CHECK_MARKS[state].color,
       dim: stale || state === 'unknown',
     })
-    const prPiece = (p: Pr, max: number | null): Piece => ({
+    // A result's mark and count, then the first failed checks by name (`✗ 3/4 windows +1`), as many as `names`
+    // says, each cut to `max`.
+    // A state saved before failed names were kept has none, until the next refresh.
+    const resultParts = (checks: Checks | null, names: number, max: number): Part[] => {
+      const failedNames = checks?.failed ?? []
+      return checks
+        ? [
+            checksPart(checks.state, `${CHECK_MARKS[checks.state].mark} ${checks.passed}/${checks.total}`),
+            ...(names > 0 && failedNames.length > 0
+              ? [
+                  {
+                    text:
+                      failedNames.slice(0, names).map(n => truncate(n, max)).join(', ') +
+                      (failedNames.length > names ? ` +${failedNames.length - names}` : ''),
+                    color: stale ? undefined : 'red',
+                    dim: stale,
+                  },
+                ]
+              : []),
+          ]
+        : []
+    }
+    const prPiece = (p: Pr, max: number | null, names = 0): Piece => ({
       key: `pr:${p.number}`,
-      parts: [
-        { text: prLabel(p, max), dim: p.draft || stale, press: () => openUrl($, p.url) },
-        ...(p.checks ? [checksPart(p.checks.state, `${CHECK_MARKS[p.checks.state].mark} ${p.checks.passed}/${p.checks.total}`)] : []),
-      ],
+      parts: [{ text: prLabel(p, max), dim: p.draft || stale, press: () => openUrl($, p.url) }, ...resultParts(p.checks, names, 16)],
     })
     const worstCheck = prList.reduce<Checks['state'] | null>(
       (w, p) => (p.checks && (w === null || CHECK_MARKS[p.checks.state].rank > CHECK_MARKS[w].rank) ? p.checks.state : w),
       null,
     )
     const prLayouts = [
-      prList.map(p => prPiece(p, Infinity)),
+      prList.map(p => prPiece(p, Infinity, 2)),
+      prList.map(p => prPiece(p, 32, 1)),
       prList.map(p => prPiece(p, 32)),
       prList.map(p => prPiece(p, 16)),
       prList.map(p => prPiece(p, null)),
@@ -1468,6 +1594,41 @@ export const register: Register = (on, options) => {
     const prLine = prList.length === 0 ? null : fullLine(listPart('pr', prLayouts))
     // Three lines tall unless squeezed to its last layout, `×N`, which has no title to frame.
     const prTall = prLayouts.find(ps => fits(piecesWidth('pr', ps)))?.some(p => p.parts.some(x => x.press)) ?? false
+
+    // ci: the workflow runs a push, a dispatch, a release or a schedule started, each with its jobs passed out of
+    // the total and the failed ones by name; a finished one stays for ten minutes.
+    const runList = workOn && prState?.kind === 'ok' ? (prState.runs ?? []).filter(r => r.doneAt === undefined || t - r.doneAt < CI_DONE_MS) : []
+    const runPiece = (r: CiRun, max: number, names: number): Piece => ({
+      key: `ci:${r.id}`,
+      parts: [{ text: truncate(r.workflow, max), dim: stale }, ...resultParts(r.checks, names, 16)],
+    })
+    const worstRun = runList.reduce<Checks['state'] | null>(
+      (w, r) => (r.checks && (w === null || CHECK_MARKS[r.checks.state].rank > CHECK_MARKS[w].rank) ? r.checks.state : w),
+      null,
+    )
+    const ciLine =
+      runList.length === 0
+        ? null
+        : fullLine(
+            listPart('ci', [
+              runList.map(r => runPiece(r, Infinity, 2)),
+              runList.map(r => runPiece(r, 24, 1)),
+              runList.map(r => runPiece(r, 12, 1)),
+              runList.map(r => runPiece(r, 12, 0)),
+              [countPiece(runList.length, undefined, ...(worstRun ? [checksPart(worstRun, CHECK_MARKS[worstRun].mark)] : []))],
+            ]),
+          )
+
+    // ms: the milestone being worked on, with its issues closed out of all of them.
+    const ms = workOn && prState?.kind === 'ok' ? (prState.milestone ?? null) : null
+    const msLine = ms
+      ? fullLine(
+          listPart('ms', [
+            [{ key: 'ms', parts: [{ text: ms.title, color: 'cyan', dim: stale }, { text: `${ms.closed}/${ms.total}`, dim: stale }] }],
+            [{ key: 'ms', parts: [{ text: truncate(ms.title, 12), color: 'cyan', dim: stale }, { text: `${ms.closed}/${ms.total}`, dim: stale }] }],
+          ]),
+        )
+      : null
 
     // Recent sessions: three equal rounded cells spread edge to edge, each with its title and age
     // together in the middle. The terminal cuts a title to the cell's columns; a desktop draws a proportional
@@ -1504,7 +1665,7 @@ export const register: Register = (on, options) => {
         </Box>
       ) : null
 
-    if (!awayLine && !statusLine && !agLine && !bgLine && !prLine && !recentLine) {
+    if (!awayLine && !statusLine && !agLine && !bgLine && !prLine && !ciLine && !msLine && !recentLine) {
       return firstLine
     }
 
@@ -1512,7 +1673,7 @@ export const register: Register = (on, options) => {
     // so the list rows stay in view instead of scrolling behind the band's `n more`. Each row is one line but
     // the framed ones (the pr row while its titles are drawn, and the recent-sessions cells), which take
     // three; the blank lines go between rows.
-    const shown = [awayLine, statusLine, agLine, bgLine, prLine, recentLine].filter(Boolean).length + 1
+    const shown = [awayLine, statusLine, msLine, agLine, bgLine, prLine, ciLine, recentLine].filter(Boolean).length + 1
     const height = shown + (prLine && prTall ? 2 : 0) + (recentLine && sessions !== null && sessions.length > 0 ? 2 : 0)
     const spacing = height + shown - 1 <= e.props.maxRows ? 1 : 0
 
@@ -1521,9 +1682,11 @@ export const register: Register = (on, options) => {
         {firstLine}
         {awayLine}
         {statusLine}
+        {msLine}
         {agLine}
         {bgLine}
         {prLine}
+        {ciLine}
         {recentLine}
       </Box>
     )

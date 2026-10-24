@@ -1,8 +1,10 @@
 {
   "name": "fleet-street",
   "version": "0.1.0",
-  "author": { "name": "Nnsée Nain" },
-  "description": "Banner above the prompt: limits, context, prompt-cache countdown, session timer, git branch, worktrees, subagents with their models, background tasks, open PRs with their checks, and the branch's diff",
+  "author": {
+    "name": "Nnsée Nain"
+  },
+  "description": "Banner above the prompt: limits, context, prompt-cache countdown, session timer, git branch, worktrees, subagents with their models, background tasks, open PRs with their checks, workflow runs, the current milestone, and the branch's diff",
   "types": "./types/index.d.ts",
   "userConfig": {
     "awayMinutes": {
@@ -28,6 +30,24 @@
       "title": "Show recent sessions",
       "description": "Show the row of recent sessions from every project; /toggle-sessions hides or shows it for the current session",
       "default": false
+    },
+    "contextWarnTokens": {
+      "type": "number",
+      "title": "Context warning (tokens)",
+      "description": "Context size at which ctx turns yellow, whatever its percentage",
+      "default": 300000
+    },
+    "contextHandoverTokens": {
+      "type": "number",
+      "title": "Context handover (tokens)",
+      "description": "Context size at which ctx turns red, the point to hand over to a new session",
+      "default": 450000
+    },
+    "milestone": {
+      "type": "string",
+      "title": "Milestone",
+      "description": "The milestone the ms row follows, by its title; empty picks the open one with the lowest version",
+      "default": ""
     }
   }
 }

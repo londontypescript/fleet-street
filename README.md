@@ -15,7 +15,9 @@ Usage and Status Banner Plugin for Claude
 - **Row 1: usage**, left to right
   - `5h`: 5-hour usage as a bar and a percentage, with the time until it resets
   - `week`: weekly usage, the same way
-  - `ctx`: context used out of the window, as tokens and a percentage
+  - `ctx`: context used out of the window, as tokens and a percentage. It turns yellow at 70% or 300k tokens
+    and red at 90% or 450k tokens, whichever comes first, so on a 1M window it warns when a session is worth
+    handing over (`contextWarnTokens`, `contextHandoverTokens`)
   - `cache`: the prompt-cache countdown, yellow in the last five minutes and red in the last minute
 - **Row 2: status**, left to right
   - Left: the git branch, green on the main branch and yellow on any other, with its diff beside it: the lines
@@ -36,6 +38,10 @@ Usage and Status Banner Plugin for Claude
   out. The label stays on the left and the entries are spread in columns across the rest of the width, each
   centred in its own, with `│` between them; the spare width is shared evenly, so a longer entry gets a wider
   column.
+  - `ms`: the milestone being worked on, with its issues closed out of all of them (`0.2.0 3/22`). It's the
+    one the `milestone` option names, else the open milestone with the lowest version number (compared as
+    versions, so `0.0.10` comes after `0.0.9`), else the open one made first. No row when the repository has
+    no open milestone. Read with `pr`'s refresh and needs the same
   - `ag`: this session's subagents, from Claude Code's own agent list, each with its description, its model and
     effort (`Opus High`, `Sonnet Med`, from its first step), a mark (`●` running, `○` waiting or idle, `✓` done, `✗` failed) and how long it has run. A finished
     one stays for two minutes. Background runs of ChatGPT through the Codex CLI (`codex-locked`, `codex exec`)
@@ -53,7 +59,15 @@ Usage and Status Banner Plugin for Claude
     while any checks are running, every 60 seconds otherwise, and at once when the branch or the worktrees
     change. It needs `gh`, signed in, and an `origin` remote on github.com; when `gh` can't answer there's no
     row. If a refresh fails after one has worked (offline, say), the last list stays, dimmed. Squeezed: titles
-    cut to 32, then 16, then left out, then `×N` with the worst mark
+    cut to 32, then 16, then left out, then `×N` with the worst mark. A failed check is named after the count
+    (`✗ 3/4 windows`), the first two at full width and the first one once squeezed, before the titles are cut
+    further
+  - `ci`: the latest run of each workflow that a push, a dispatch, a release or a schedule started (a release
+    check, a run on the main branch after a merge), not a PR's, which are on `pr`, nor CodeQL's or issue
+    triggers'. Each shows its jobs passed out of the total, marked as on `pr`, with the failed ones named. A run
+    stays while it runs and for ten minutes after it finishes; at most three. Read with `pr`'s refresh, at its
+    faster pace while one runs. Squeezed: names cut to 24, then 12, then the failed names left out, then `×N`
+    with the worst mark
 - **Recent sessions**, the last row, off unless turned on: the three most recently active other sessions in the
   desktop app, from any project, each in its own box with its title and how long ago it was last active.
   Clicking a title opens that session. `/toggle-sessions` shows or hides the row for the session, and
@@ -89,8 +103,11 @@ Set in the plugin's config:
 | --- | --- | --- |
 | `awayMinutes` | `30` | Minutes without activity before the banner asks whether to keep the session timer going |
 | `mainBranch` | `main` | The branch shown in green; any other branch is shown in yellow |
-| `showWork` | `true` | Show the `pr` row and the diff beside the branch |
+| `showWork` | `true` | Show the `ms`, `pr` and `ci` rows and the diff beside the branch |
 | `showSessions` | `false` | Show the row of recent sessions |
+| `contextWarnTokens` | `300000` | Context size at which `ctx` turns yellow, whatever its percentage |
+| `contextHandoverTokens` | `450000` | Context size at which `ctx` turns red |
+| `milestone` | (empty) | The milestone `ms` follows, by its title; empty picks the open one with the lowest version |
 
 ## Commands
 
