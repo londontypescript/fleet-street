@@ -21,8 +21,8 @@
     },
     "showWork": {
       "type": "boolean",
-      "title": "Show PRs and diff",
-      "description": "Show the row of open PRs (with their checks) and the diff beside the branch, against the expected branch",
+      "title": "Show PRs, runs, milestone and diff",
+      "description": "Show the milestone, open PRs (with their checks) and workflow runs rows, and the diff beside the branch against the expected branch",
       "default": true
     },
     "showSessions": {

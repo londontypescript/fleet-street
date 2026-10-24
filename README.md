@@ -63,11 +63,12 @@ Usage and Status Banner Plugin for Claude
     (`✗ 3/4 windows`), the first two at full width and the first one once squeezed, before the titles are cut
     further
   - `ci`: the latest run of each workflow that a push, a dispatch, a release or a schedule started (a release
-    check, a run on the main branch after a merge), not a PR's, which are on `pr`, nor CodeQL's or issue
-    triggers'. Each shows its jobs passed out of the total, marked as on `pr`, with the failed ones named. A run
-    stays while it runs and for ten minutes after it finishes; at most three. Read with `pr`'s refresh, at its
-    faster pace while one runs. Squeezed: names cut to 24, then 12, then the failed names left out, then `×N`
-    with the worst mark
+    check, a run on the main branch after a merge), not a PR's, which are on `pr`, nor those of CodeQL's
+    default setup or of issue triggers (a CodeQL workflow of your own that runs on push does show). Each
+    shows its jobs passed out of the total, marked as on `pr`, with the failed ones named; a run that failed
+    or was cancelled is marked failed whatever its jobs say. A run stays while it runs and for ten minutes
+    after it finishes; at most three. Read with `pr`'s refresh, at its faster pace while one runs. Squeezed:
+    names cut to 24, then 12, then the failed names left out, then `×N` with the worst mark
 - **Recent sessions**, the last row, off unless turned on: the three most recently active other sessions in the
   desktop app, from any project, each in its own box with its title and how long ago it was last active.
   Clicking a title opens that session. `/toggle-sessions` shows or hides the row for the session, and

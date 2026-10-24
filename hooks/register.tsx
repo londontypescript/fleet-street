@@ -765,20 +765,32 @@ const jobChecks = (raw: unknown): Checks | null =>
 const CI_EVENTS = new Set(['push', 'workflow_dispatch', 'release', 'schedule', 'merge_group', 'repository_dispatch'])
 const CI_RUNS = 3
 const CI_DONE_MS = 10 * 60_000
-const RUN_FIELDS = 'databaseId,workflowName,event,status,conclusion,url,updatedAt'
+const RUN_FIELDS = 'databaseId,workflowDatabaseId,workflowName,event,status,conclusion,url,updatedAt'
+// Runs listed per refresh: enough that a burst of PR runs doesn't push a running release check off the list.
+const RUN_LIST = '100'
 
 const pickRuns = (list: Record<string, unknown>[], t: number) => {
   const picked: Record<string, unknown>[] = []
   const seen = new Set<string>()
-  // gh lists the newest first.
+  // gh lists the newest first. Workflows go by id: two files may share a name. A skipped latest run still
+  // counts as the latest, so an older result doesn't show in its place.
   for (const r of list) {
-    const workflow = String(r.workflowName ?? '')
-    if (!CI_EVENTS.has(String(r.event)) || r.conclusion === 'skipped' || seen.has(workflow)) continue
+    const workflow = String(r.workflowDatabaseId ?? r.workflowName ?? '')
+    if (!CI_EVENTS.has(String(r.event)) || seen.has(workflow)) continue
     seen.add(workflow)
+    if (r.conclusion === 'skipped') continue
     if (r.status === 'completed' && t - Date.parse(String(r.updatedAt)) >= CI_DONE_MS) continue
     picked.push(r)
   }
   return picked.slice(0, CI_RUNS)
+}
+
+// A run's own result outranks its jobs': one that failed to start has no jobs, and a cancelled one may have
+// only passed jobs.
+const withRunResult = (checks: Checks | null, status: string, conclusion: string): Checks | null => {
+  const failed = status === 'completed' && CHECK_FAILED.has(conclusion.toUpperCase())
+  if (!failed) return checks
+  return { passed: 0, total: 0, running: false, failed: [], ...checks, state: 'fail' }
 }
 
 // A version-like title (0.2.0, v1.4) as numbers to compare by; null when it isn't one.
@@ -909,7 +921,7 @@ async function scanPrs($: EngineInterface) {
   const [answers, milestones, runList] = await Promise.all([
     mapLimit(ctx.branches, 4, b => gh('pr', 'list', '-R', slug, '--head', b, '--state', 'open', '--limit', '20', '--json', PR_FIELDS)),
     gh('api', `repos/${slug}/milestones?state=open&per_page=100`),
-    gh('run', 'list', '-R', slug, '--limit', '30', '--json', RUN_FIELDS),
+    gh('run', 'list', '-R', slug, '--limit', RUN_LIST, '--json', RUN_FIELDS),
   ])
   // The repository or branches changed while gh ran; the refresh that change asked for follows.
   if (contextKey(repoContext) !== key) return
@@ -978,7 +990,11 @@ async function scanPrs($: EngineInterface) {
             id,
             workflow: String(r.workflowName ?? ''),
             url: String(r.url ?? ''),
-            checks: answer ? jobChecks(answer.jobs) : (before?.runs?.find(x => x.id === id)?.checks ?? null),
+            checks: withRunResult(
+              answer ? jobChecks(answer.jobs) : (before?.runs?.find(x => x.id === id)?.checks ?? null),
+              String(r.status ?? ''),
+              String(r.conclusion ?? ''),
+            ),
             ...(r.status === 'completed' ? { doneAt: Date.parse(String(r.updatedAt)) } : {}),
           }
         })
@@ -1573,7 +1589,10 @@ export const register: Register = (on, options) => {
       const failedNames = checks?.failed ?? []
       return checks
         ? [
-            checksPart(checks.state, `${CHECK_MARKS[checks.state].mark} ${checks.passed}/${checks.total}`),
+            checksPart(
+              checks.state,
+              checks.total === 0 ? CHECK_MARKS[checks.state].mark : `${CHECK_MARKS[checks.state].mark} ${checks.passed}/${checks.total}`,
+            ),
             ...(names > 0 && failedNames.length > 0
               ? [
                   {
