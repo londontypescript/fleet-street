@@ -22,20 +22,31 @@ export type RecentSession = { id: string; title: string; updatedAt: number; link
 
 // A PR's reported checks (or a workflow run's jobs): how many passed out of how many, the worst result among
 // them, whether any are still running (a failure outranks them in state, but they still want watching), and
-// the names of the failed ones.
+// the names of the failed ones. For a PR the total includes the checks its base branch requires that haven't
+// reported (missing); while any are missing and none failed or runs, the state is waiting.
 export type Checks = {
   passed: number
   total: number
-  state: 'fail' | 'running' | 'pass' | 'unknown'
+  state: 'fail' | 'running' | 'waiting' | 'pass' | 'unknown'
   running: boolean
   failed: string[]
+  missing?: number
 }
-export type Pr = { number: number; title: string; url: string; branch: string; draft: boolean; checks: Checks | null }
+// conflict: GitHub says it can't merge into its base, so the workflows a pull_request event starts don't run.
+export type Pr = {
+  number: number
+  title: string
+  url: string
+  branch: string
+  draft: boolean
+  conflict?: boolean
+  checks: Checks | null
+}
 // A workflow run that isn't a PR's (a push, a dispatch, a release, a schedule), with its jobs as checks;
 // doneAt once it has finished.
 export type CiRun = { id: number; workflow: string; url: string; checks: Checks | null; doneAt?: number }
-// The milestone being worked on, with its issues closed and in all.
-export type Milestone = { title: string; url: string; closed: number; total: number }
+// The milestone being worked on, with its issues closed and in all, and the headline of its description.
+export type Milestone = { title: string; url: string; closed: number; total: number; headline?: string }
 // loading: before the first answer; ok: the lists, stale once a later refresh failed; unavailable: gh can't answer.
 export type PrState =
   | { kind: 'loading' }
