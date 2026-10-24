@@ -1334,32 +1334,22 @@ export const register: Register = (on, options) => {
     // squeezed one step at a time until the row fits, and left out when even the last step doesn't.
     type Part = { text: string; color?: string; dim?: boolean; press?: () => void }
     type Piece = { key: string; parts: Part[] }
-    // The label, then each entry with the gap before it, its parts with a gap between each, each pressable
-    // part's frame (a border and a column of padding each side), and each │ with the gap after it.
+    // The label, then each entry with the gap before it, its parts with a gap between each, and each │ with the
+    // gap after it.
     const piecesWidth = (label: string, pieces: Piece[]): Width => ({
       text: cells(label) + pieces.reduce((w, p) => w + p.parts.reduce((n, x) => n + cells(x.text), 0), 0) + Math.max(0, pieces.length - 1),
       gaps:
-        pieces.reduce((w, p) => w + 1 + p.parts.length - 1 + 4 * p.parts.filter(x => x.press).length, 0) +
+        pieces.reduce((w, p) => w + 1 + p.parts.length - 1, 0) +
         Math.max(0, pieces.length - 1),
     })
-    // A pressable part (a PR's title) is framed like a recent-sessions cell, so it reads as a button; its row
-    // is then three lines tall.
+    // A pressable part (a PR's title) is a plain button: it reads as text and shows it's pressable on hover.
     const drawPieces = (pieces: Piece[]) =>
       pieces.flatMap((p, i) => {
         const piece = (
           <Box key={p.key} flexWrap="nowrap" alignItems="center" columnGap={1}>
             {p.parts.map((x, j) =>
               x.press ? (
-                <Box
-                  key={`f:${p.key}:${j}`}
-                  flexWrap="nowrap"
-                  borderStyle="round"
-                  borderDimColor
-                  hover={{ borderDimColor: false }}
-                  paddingX={1}
-                >
-                  <Button key={`${p.key}:${j}`} label={x.text} plain dimColor={x.dim} onPress={x.press} />
-                </Box>
+                <Button key={`${p.key}:${j}`} label={x.text} plain dimColor={x.dim} onPress={x.press} />
               ) : (
                 <Text key={`${p.key}:${j}`} color={x.color} dimColor={x.dim}>
                   {x.text}
@@ -1521,6 +1511,7 @@ export const register: Register = (on, options) => {
     const columns = (w: Width) => Math.ceil(w.text * scale) + w.gaps
     const sideColumns = (diff: boolean) => Math.max(columns(leftWidth(diff)), columns(rightWidth))
     // ms: the milestone being worked on, its title, a bar of its issues closed and the count (`0.2.0 ██░░░░ 3/22`).
+    // Clicking the title opens the milestone on GitHub.
     const ms = workOn && prState?.kind === 'ok' ? (prState.milestone ?? null) : null
     const msStale = prState?.kind === 'ok' && prState.stale
     const msCount = ms ? `${ms.closed}/${ms.total}` : ''
@@ -1557,9 +1548,11 @@ export const register: Register = (on, options) => {
       ms && row2Fit.ms ? (
         <Box flexWrap="nowrap" columnGap={1}>
           <Text bold>ms</Text>
-          <Text color="cyan" dimColor={msStale}>
-            {ms.title}
-          </Text>
+          <Button key="ms" plain onPress={() => openUrl($, ms.url)}>
+            <Text color="cyan" dimColor={msStale}>
+              {ms.title}
+            </Text>
+          </Button>
           {row2Fit.ms === 'bar' ? (
             <Box>
               <Text color="cyan" dimColor={msStale}>
@@ -1671,8 +1664,6 @@ export const register: Register = (on, options) => {
       [countPiece(prList.length, undefined, ...(worstCheck ? [checksPart(worstCheck, CHECK_MARKS[worstCheck].mark)] : []))],
     ]
     const prLine = prList.length === 0 ? null : fullLine(listPart('pr', prLayouts))
-    // Three lines tall unless squeezed to its last layout, `×N`, which has no title to frame.
-    const prTall = prLayouts.find(ps => fits(piecesWidth('pr', ps)))?.some(p => p.parts.some(x => x.press)) ?? false
 
     // ci: the workflow runs a push, a dispatch, a release or a schedule started, each with its jobs passed out of
     // the total and the failed ones by name; a finished one stays for ten minutes.
@@ -1717,8 +1708,8 @@ export const register: Register = (on, options) => {
                 justifyContent="center"
                 columnGap={1}
                 borderStyle="round"
-                borderDimColor
-                hover={{ borderDimColor: false }}
+                borderColor="gray"
+                hover={{ borderColor: 'white' }}
                 paddingX={1}
               >
                 <Box flexShrink={1} overflow="hidden">
@@ -1739,10 +1730,9 @@ export const register: Register = (on, options) => {
 
     // A blank line between rows while they all fit in the rows the band may take; packed tight when they don't,
     // so the list rows stay in view instead of scrolling behind the band's `n more`. Each row is one line but
-    // the framed ones (the pr row while its titles are drawn, and the recent-sessions cells), which take
-    // three; the blank lines go between rows.
+    // the recent-sessions cells, which take three; the blank lines go between rows.
     const shown = [awayLine, statusLine, agLine, bgLine, prLine, ciLine, recentLine].filter(Boolean).length + 1
-    const height = shown + (prLine && prTall ? 2 : 0) + (recentLine && sessions !== null && sessions.length > 0 ? 2 : 0)
+    const height = shown + (recentLine && sessions !== null && sessions.length > 0 ? 2 : 0)
     const spacing = height + shown - 1 <= e.props.maxRows ? 1 : 0
 
     return (
