@@ -15,7 +15,9 @@ Usage and Status Banner Plugin for Claude
 - **Row 1: usage**, left to right
   - `5h`: 5-hour usage as a bar and a percentage, with the time until it resets
   - `week`: weekly usage, the same way
-  - `ctx`: context used out of the window, as tokens and a percentage
+  - `ctx`: context used out of the window, as tokens and a percentage. It turns yellow at 70% or 300k tokens
+    and red at 90% or 450k tokens, whichever comes first, so on a 1M window it warns when a session is worth
+    handing over (`contextWarnTokens`, `contextHandoverTokens`)
   - `cache`: the prompt-cache countdown, yellow in the last five minutes and red in the last minute
 - **Row 2: status**, left to right
   - Left: the git branch, green on the main branch and yellow on any other, with its diff beside it: the lines
@@ -23,12 +25,17 @@ Usage and Status Banner Plugin for Claude
     included (the lines of the first 200 new files), as `+152 −32`, and not shown when there's nothing. It
     compares with the merge-base of `HEAD` and `origin/<mainBranch>` (the local `<mainBranch>` when there's no
     such remote branch), as the refs stand locally: nothing is fetched
-  - Middle: `wt`, the repository's other worktrees that you made, each by its branch (by its folder when
+  - Middle: `ms`, the milestone being worked on, with a bar and a count of its issues closed out of all of
+    them (`0.2.0 ██░░░░ 3/22`). It's the one the `milestone` option names, else the open milestone with the
+    lowest version number (compared as versions, so `0.0.10` comes after `0.0.9`), else the open one made
+    first; not shown when the repository has no open milestone. Read with `pr`'s refresh and needs the same
+  - Middle, after it: `wt`, the repository's other worktrees that you made, each by its branch (by its folder when
     detached), shown only when there are some. Subagents' worktrees (`.claude/worktrees/agent-…`) are left out:
     their agents are on `ag`
   - Right: `time`, how long the session has been running
-  - When the row runs out of room, the worktrees are squeezed a step at a time (full names first, then cut to
-    24, then 12, then the first names and `+N`, then `×N`), then left out, then the diff is left out
+  - When the row runs out of room, the milestone's bar is left out, then the worktrees are squeezed a step at a
+    time (full names first, then cut to 24, then 12, then the first names and `+N`, then `×N`), then the
+    milestone is left out, then the worktrees, then the diff
 - **The list rows** below it each appear only while they have something to show, so a quiet session is two
   rows tall. Rows have a blank line between them while they all fit in the space the app gives the banner
   (at most half the terminal); when they wouldn't, they're packed tight. Each is a label and its entries; when a row runs out of room it is squeezed a step at a time, as
@@ -53,7 +60,16 @@ Usage and Status Banner Plugin for Claude
     while any checks are running, every 60 seconds otherwise, and at once when the branch or the worktrees
     change. It needs `gh`, signed in, and an `origin` remote on github.com; when `gh` can't answer there's no
     row. If a refresh fails after one has worked (offline, say), the last list stays, dimmed. Squeezed: titles
-    cut to 32, then 16, then left out, then `×N` with the worst mark
+    cut to 32, then 16, then left out, then `×N` with the worst mark. A failed check is named after the count
+    (`✗ 3/4 windows`), the first two at full width and the first one once squeezed, before the titles are cut
+    further
+  - `ci`: the latest run of each workflow that a push, a dispatch, a release or a schedule started (a release
+    check, a run on the main branch after a merge), not a PR's, which are on `pr`, nor those of CodeQL's
+    default setup or of issue triggers (a CodeQL workflow of your own that runs on push does show). Each
+    shows its jobs passed out of the total, marked as on `pr`, with the failed ones named; a run that failed
+    or was cancelled is marked failed whatever its jobs say. A run stays while it runs and for ten minutes
+    after it finishes; at most three. Read with `pr`'s refresh, at its faster pace while one runs. Squeezed:
+    names cut to 24, then 12, then the failed names left out, then `×N` with the worst mark
 - **Recent sessions**, the last row, off unless turned on: the three most recently active other sessions in the
   desktop app, from any project, each in its own box with its title and how long ago it was last active.
   Clicking a title opens that session. `/toggle-sessions` shows or hides the row for the session, and
@@ -89,8 +105,11 @@ Set in the plugin's config:
 | --- | --- | --- |
 | `awayMinutes` | `30` | Minutes without activity before the banner asks whether to keep the session timer going |
 | `mainBranch` | `main` | The branch shown in green; any other branch is shown in yellow |
-| `showWork` | `true` | Show the `pr` row and the diff beside the branch |
+| `showWork` | `true` | Show the milestone and the diff beside the branch, and the `pr` and `ci` rows |
 | `showSessions` | `false` | Show the row of recent sessions |
+| `contextWarnTokens` | `300000` | Context size at which `ctx` turns yellow, whatever its percentage |
+| `contextHandoverTokens` | `450000` | Context size at which `ctx` turns red |
+| `milestone` | (empty) | The milestone `ms` follows, by its title; empty picks the open one with the lowest version |
 
 ## Commands
 
