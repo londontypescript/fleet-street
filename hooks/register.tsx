@@ -850,7 +850,8 @@ const headlineOf = (description: string) => {
 // at once both fetch, which costs a request but never a wrong answer. A file torn by a crash or by two writers
 // fails to parse and counts as missing, so it's fetched again.
 type PrFail = { kind: 'unavailable' | 'stale' | 'rate'; reason: string }
-type Shared<T> = { v: 1; at: number; failedAt: number; failure: PrFail | null; attemptAt: number; data: T | null }
+// askedAt: when the fetch that gave the answer set out, which says which of two answers is newer.
+type Shared<T> = { v: 1; at: number; askedAt?: number; failedAt: number; failure: PrFail | null; attemptAt: number; data: T | null }
 // A PR as shared: its checks are summarised by each session against the required checks it reads.
 type SharedPr = Omit<Pr, 'checks'> & { base: string; rollup: unknown }
 
@@ -957,22 +958,23 @@ const isDue = (s: Shared<unknown> | null, every: number, t: number) => {
 const backoffFile = async ($: EngineInterface) => `${await sharedRoot($)}/backoff.json`
 
 // Fetches one resource: marks the file as being fetched, runs `fetch`, and writes its answer or its failure,
-// keeping the last good answer. An answer that lands after a newer one from another session is dropped.
+// keeping the last good answer. An answer that lands after one from a fetch that set out later is dropped.
 async function fetchShared<T>($: EngineInterface, path: string, fetch: (before: T | null) => Promise<{ data: T } | { failure: PrFail }>) {
   const started = Date.now()
   const before = (await readShared<T>($, path)) ?? EMPTY
   await writeShared($, path, { ...before, attemptAt: started })
   const got = await fetch(before.data)
   const now = (await readShared<T>($, path)) ?? before
+  const newer = (now.askedAt ?? 0) > started
   if ('data' in got) {
-    if (now.at > started) return
-    await writeShared($, path, { ...now, v: 1, at: Date.now(), failure: null, data: got.data })
+    if (newer) return
+    await writeShared($, path, { ...now, v: 1, at: Date.now(), askedAt: started, failure: null, data: got.data })
     return
   }
   if (got.failure.kind === 'rate') {
     await $.fs.write(await backoffFile($), JSON.stringify({ until: Date.now() + PR_BACKOFF_MS })).catch(() => {})
   }
-  if (now.at > started) return
+  if (newer || now.at > started) return
   await writeShared($, path, { ...now, failedAt: Date.now(), failure: got.failure })
 }
 
@@ -1031,6 +1033,9 @@ const fetchRuns = (slug: string, gh: (...a: string[]) => Promise<GhRan>) => asyn
   if (!Array.isArray(got.data)) return { failure: { kind: 'stale', reason: 'gh gave an unreadable reply' } as PrFail }
   const picked = pickRuns(got.data as Record<string, unknown>[], Date.now())
   const jobs = await Promise.all(picked.map(r => gh('run', 'view', String(r.databaseId), '-R', slug, '--json', 'jobs')))
+  // A rate limit on any of them holds every fetch off, as one on the list does.
+  const limited = jobs.map(j => classifyGh(slug, j)).find(f => f?.kind === 'rate')
+  if (limited) return { failure: limited }
   const runs: CiRun[] = picked.map((r, i) => {
     const id = Number(r.databaseId)
     const answer = ghJson(slug, jobs[i] as GhRan)
@@ -1051,8 +1056,10 @@ const fetchRuns = (slug: string, gh: (...a: string[]) => Promise<GhRan>) => asyn
 
 let prsRunning = false
 let prsAgain = false
-// The fetches this session has running, by file.
+// The fetches this session has running, by file, and when it last set out for each: never again within
+// PR_FAST_MS, so a file that can't be written (and so always looks due) can't set off a run of fetches.
 const fetching = new Set<string>()
+const fetchedAt = new Map<string, number>()
 let prsShown = ''
 let prsLogged = ''
 
@@ -1133,7 +1140,9 @@ async function syncPrs($: EngineInterface) {
     await setPrs($, { kind: 'loading' })
   } else {
     prsLogged = ''
-    const stale = failure !== null || answered.some(s => t - s.at >= SHARED_STALE_MS)
+    // The milestone and the runs count too: an answer of theirs that has failed since or is too old dims the rows.
+    const old = (s: Shared<unknown> | null) => s !== null && s.at > 0 && (s.failedAt > s.at || t - s.at >= SHARED_STALE_MS)
+    const stale = failure !== null || answered.some(s => t - s.at >= SHARED_STALE_MS) || old(milestones) || old(runsAnswer)
     await setPrs($, { kind: 'ok', prs: prsFound, runs: runList, milestone: shownMilestone, stale })
   }
 
@@ -1180,8 +1189,9 @@ async function syncPrs($: EngineInterface) {
   })
   for (const d of due) {
     if (fetching.size >= FETCHES) break
-    if (fetching.has(d.path)) continue
+    if (fetching.has(d.path) || t - (fetchedAt.get(d.path) ?? 0) < PR_FAST_MS) continue
     fetching.add(d.path)
+    fetchedAt.set(d.path, t)
     void d
       .run()
       .catch(err => logCache($, `fetch failed: ${err}`))
