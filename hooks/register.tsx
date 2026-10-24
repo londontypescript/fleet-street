@@ -113,7 +113,7 @@ async function setBgTasks($: EngineInterface, fn: (list: BgTask[]) => BgTask[]) 
 // A task-notification names its task as <task-id>…</task-id>.
 async function endTasksIn($: EngineInterface, text: string) {
   if (bgCount === 0 || !text.includes('<task-notification')) return
-  const ids = new Set([...text.matchAll(/<task-id>([^<]+)<\/task-id>/g)].map(m => m[1].trim()))
+  const ids = new Set([...text.matchAll(/<task-id>([^<]+)<\/task-id>/g)].flatMap(m => (m[1] ? [m[1].trim()] : [])))
   if (ids.size > 0) await setBgTasks($, list => list.filter(b => !ids.has(b.id)))
 }
 
@@ -1235,26 +1235,23 @@ export const register: Register = (on, options) => {
         )
         return i === 0 ? [piece] : [sep, piece]
       })
-    // The first layout that fits. A squeezed row is nearly full, so its entries are spread across the width to
-    // even out what's left; one with room to spare stays to the left. The label stays with the first entry.
+    // The first layout that fits, its label on the left and its entries in columns across the rest of the width,
+    // each centred in its own with the │ between them. The spare width is shared evenly between the columns, so
+    // a longer entry gets a wider one.
     const listPart = (label: string, layouts: Piece[][]) => {
       const fit = layouts.find(ps => fits(piecesWidth(label, ps)))
       if (!fit) return null
-      const squeezed = fit !== layouts[0]
-      const [first, ...rest] = drawPieces(fit)
       return (
-        <Box
-          width={squeezed ? '100%' : undefined}
-          flexWrap="nowrap"
-          alignItems="center"
-          justifyContent={squeezed ? 'space-between' : undefined}
-          columnGap={1}
-        >
-          <Box flexWrap="nowrap" alignItems="center" columnGap={1}>
-            <Text bold>{label}</Text>
-            {first}
-          </Box>
-          {rest}
+        <Box width="100%" flexWrap="nowrap" alignItems="center" columnGap={1}>
+          <Text bold>{label}</Text>
+          {fit.flatMap((p, i) => {
+            const column = (
+              <Box key={`c:${p.key}`} flexGrow={1} flexWrap="nowrap" justifyContent="center">
+                {drawPieces([p])}
+              </Box>
+            )
+            return i === 0 ? [column] : [sep, column]
+          })}
         </Box>
       )
     }
