@@ -668,14 +668,13 @@ async function readDiff(git: Git): Promise<DiffState> {
 // PRs are looked up for at most this many branches: this session's, then the worktrees'.
 const PR_BRANCHES = 10
 const PR_FIELDS = 'number,title,url,headRefName,baseRefName,isDraft,isCrossRepository,mergeable,statusCheckRollup'
-// The checks a base branch requires (its rulesets' and its classic protection's) are read again this often.
+// The checks a base branch requires (its rulesets' and its classic protection's) are fetched again this often.
 const REQUIRED_MS = 5 * 60_000
-// While any shown PR has checks running, then once they've all finished, and after a rate-limit reply.
+// A resource is fetched again this often while any of its checks or runs are going, else this often; a
+// rate-limit reply holds off every fetch for the third.
 const PR_FAST_MS = 15_000
 const PR_SLOW_MS = 60_000
 const PR_BACKOFF_MS = 5 * 60_000
-// A main turn's end refreshes the PRs at most this often.
-const PR_TURN_MS = 15_000
 
 // A check run's conclusion, or a legacy status context's state, that counts as failed or passed.
 const CHECK_FAILED = new Set(['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE', 'STALE', 'ERROR'])
@@ -842,37 +841,29 @@ const headlineOf = (description: string) => {
   return (colon ?? /^(.+?[.!?])(\s|$)/.exec(text)?.[1] ?? text).trim()
 }
 
-// Runs fn over the items, at most limit at once, keeping their order.
-async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  const out = new Array<R>(items.length)
-  let next = 0
-  const worker = async () => {
-    while (next < items.length) {
-      const i = next++
-      out[i] = await fn(items[i] as T)
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
-  return out
-}
+// GitHub answers are shared by every session through small files, one per resource: the open PRs of each
+// branch, the open milestones, the latest runs, and each base branch's required checks from each source. Every
+// session runs its own copy of this mod, so without them four sessions on one repository asked GitHub the same
+// things four times. Each file holds its last good answer and when it came (`at`), the last failure and when
+// (`failedAt`), and when a session last set out to fetch it (`attemptAt`). A session fetches a resource only
+// when its answer is due and no other session set out for it in the last ATTEMPT_MS; two sessions that set out
+// at once both fetch, which costs a request but never a wrong answer. A file torn by a crash or by two writers
+// fails to parse and counts as missing, so it's fetched again.
+type PrFail = { kind: 'unavailable' | 'stale' | 'rate'; reason: string }
+type Shared<T> = { v: 1; at: number; failedAt: number; failure: PrFail | null; attemptAt: number; data: T | null }
+// A PR as shared: its checks are summarised by each session against the required checks it reads.
+type SharedPr = Omit<Pr, 'checks'> & { base: string; rollup: unknown }
 
-let prsRunning = false
-let prsAgain = false
-let prsStartedAt = 0
-// When the clock next refreshes the PRs, and until when a rate-limit reply holds off every refresh.
-let prsDueAt = 0
-let prsBackoffUntil = 0
-// The repository (top folder and slug) the shown PRs belong to, and the reason last logged.
-let prsFor = ''
-let prsLogged = ''
-let prsShown = ''
-let extrasLogged = ''
-// The checks each base branch requires, by repository, branch and source (its rulesets, its classic
-// protection): the names last read, when they were read, and when they were last asked for. A source that
-// fails keeps its last answer until that is REQUIRED_KEEP_MS old; after that it counts for nothing.
-type Required = { names: string[]; readAt: number; askedAt: number }
-const requiredKnown = new Map<string, Required>()
+// Another session's fetch is waited for this long; a fetch is up to two gh calls of 15 s at most.
+const ATTEMPT_MS = 30_000
+// A failed fetch is tried again after this long (a rate limit holds off every fetch for PR_BACKOFF_MS).
+const RETRY_MS = 60_000
+// An answer this old counts as stale whatever the failures say: whoever was fetching it has stopped.
+const SHARED_STALE_MS = 5 * 60_000
+// A required-checks answer that can't be refreshed counts for this long, then for nothing.
 const REQUIRED_KEEP_MS = 30 * 60_000
+// At most this many fetches run at once in one session.
+const FETCHES = 4
 
 // The check names a ruleset (`rules/branches/<base>`) requires.
 const rulesetNames = (rules: unknown) => {
@@ -895,40 +886,95 @@ const classicNames = (branchInfo: unknown) => {
   if (Array.isArray(classic?.checks)) names.push(...(classic.checks as Record<string, unknown>[]).map(c => String(c.context ?? '')))
   return names.filter(Boolean)
 }
+const REQUIRED_SOURCES = [
+  { id: 'rules', path: (slug: string, b: string) => `repos/${slug}/rules/branches/${encodeURIComponent(b)}`, names: rulesetNames },
+  { id: 'classic', path: (slug: string, b: string) => `repos/${slug}/branches/${encodeURIComponent(b)}`, names: classicNames },
+]
 
-async function refreshPrs($: EngineInterface) {
-  if (prsRunning) {
-    prsAgain = true
+// FNV-1a, as eight hex digits: a branch's file name, so `feat/x` and `Feat/x` never share one.
+const hashOf = (text: string) => {
+  let h = 0x811c9dc5
+  for (const ch of text) h = Math.imul(h ^ (ch.codePointAt(0) ?? 0), 0x01000193) >>> 0
+  return h.toString(16).padStart(8, '0')
+}
+// A readable, safe start of the name for whoever looks in the folder, then its hash.
+const fileName = (kind: string, name: string) => `${kind}-${name.replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 40)}-${hashOf(name)}.json`
+
+// The folder the shared files go in: fleet-street/github under Claude's configuration folder (CLAUDE_CONFIG_DIR,
+// else .claude in the home folder), else the plugin's own .cache. One folder per repository, by its slug in
+// lower case, as GitHub's names are.
+let cacheRoot: string | undefined
+async function sharedRoot($: EngineInterface) {
+  if (cacheRoot === undefined) {
+    const config = await $.env.get('CLAUDE_CONFIG_DIR')
+    const home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE'))
+    const base = config || (home ? `${home.replace(/[\\/]+$/, '')}/.claude` : `${$.plugin.root}/.cache`)
+    cacheRoot = `${base.replace(/[\\/]+$/, '')}/fleet-street/github`
+  }
+  return cacheRoot
+}
+const repoFolder = async ($: EngineInterface, slug: string) => `${await sharedRoot($)}/${slug.toLowerCase().replace('/', '__')}`
+
+// The last good copy of each file this session read or wrote, for when the file can't be read or parsed.
+const sharedKnown = new Map<string, Shared<unknown>>()
+let cacheLogged = ''
+const logCache = ($: EngineInterface, what: string) => {
+  if (what !== cacheLogged) {
+    cacheLogged = what
+    $.ui.log(`fleet-street: shared cache: ${what}`)
+  }
+}
+
+async function readShared<T>($: EngineInterface, path: string): Promise<Shared<T> | null> {
+  try {
+    const s = JSON.parse(await $.fs.read(path)) as Shared<T>
+    if (s?.v === 1 && typeof s.at === 'number' && typeof s.failedAt === 'number' && typeof s.attemptAt === 'number') {
+      sharedKnown.set(path, s)
+      return s
+    }
+  } catch {
+    // Missing, or torn: what this session last saw stands in, else nothing.
+  }
+  return (sharedKnown.get(path) as Shared<T> | undefined) ?? null
+}
+
+async function writeShared<T>($: EngineInterface, path: string, s: Shared<T>) {
+  sharedKnown.set(path, s)
+  await $.fs.write(path, JSON.stringify(s)).catch(err => logCache($, `could not write ${path}: ${err}`))
+}
+
+const EMPTY: Shared<never> = { v: 1, at: 0, failedAt: 0, failure: null, attemptAt: 0, data: null }
+
+// Whether a resource needs fetching: never fetched, its answer older than `every`, or its last failure older
+// than RETRY_MS; but not while another session set out for it less than ATTEMPT_MS ago.
+const isDue = (s: Shared<unknown> | null, every: number, t: number) => {
+  if (!s) return true
+  if (s.attemptAt > Math.max(s.at, s.failedAt) && t - s.attemptAt < ATTEMPT_MS) return false
+  return s.failedAt > s.at ? t - s.failedAt >= RETRY_MS : t - s.at >= every
+}
+
+// The account's rate limit is shared by every repository, so a rate-limit reply holds off every fetch.
+const backoffFile = async ($: EngineInterface) => `${await sharedRoot($)}/backoff.json`
+
+// Fetches one resource: marks the file as being fetched, runs `fetch`, and writes its answer or its failure,
+// keeping the last good answer. An answer that lands after a newer one from another session is dropped.
+async function fetchShared<T>($: EngineInterface, path: string, fetch: (before: T | null) => Promise<{ data: T } | { failure: PrFail }>) {
+  const started = Date.now()
+  const before = (await readShared<T>($, path)) ?? EMPTY
+  await writeShared($, path, { ...before, attemptAt: started })
+  const got = await fetch(before.data)
+  const now = (await readShared<T>($, path)) ?? before
+  if ('data' in got) {
+    if (now.at > started) return
+    await writeShared($, path, { ...now, v: 1, at: Date.now(), failure: null, data: got.data })
     return
   }
-  prsRunning = true
-  try {
-    do {
-      prsAgain = false
-      prsStartedAt = Date.now()
-      // Not due again until this one sets when; otherwise each clock tick while gh runs queues another.
-      prsDueAt = Infinity
-      await scanPrs($)
-    } while (prsAgain && Date.now() >= prsBackoffUntil)
-    // A refresh asked for during a rate-limit backoff waits for the backoff to end.
-    if (prsAgain) prsDueAt = Math.min(prsDueAt, prsBackoffUntil)
-  } catch (err) {
-    $.ui.log(`fleet-street: PR refresh failed: ${err}`)
-    prsDueAt = Date.now() + PR_SLOW_MS
-  } finally {
-    prsRunning = false
+  if (got.failure.kind === 'rate') {
+    await $.fs.write(await backoffFile($), JSON.stringify({ until: Date.now() + PR_BACKOFF_MS })).catch(() => {})
   }
+  if (now.at > started) return
+  await writeShared($, path, { ...now, failedAt: Date.now(), failure: got.failure })
 }
-
-async function setPrs($: EngineInterface, next: PrState | null) {
-  const key = JSON.stringify(next)
-  if (key !== prsShown) {
-    prsShown = key
-    await update($, prs, () => next)
-  }
-}
-
-type PrFail = { kind: 'unavailable' | 'stale' | 'rate'; reason: string }
 
 const classifyGh = (slug: string, ran: { run: ProcessRunResult } | { error: string }): PrFail | null => {
   if ('error' in ran) {
@@ -942,179 +988,208 @@ const classifyGh = (slug: string, ran: { run: ProcessRunResult } | { error: stri
   return { kind: 'stale', reason: err.trim().split(/\r?\n/)[0]?.slice(0, 80) || `gh exited ${ran.run.exitCode}` }
 }
 
+type GhRan = { run: ProcessRunResult } | { error: string }
+// A gh answer as JSON, or why there's none.
+const ghJson = (slug: string, ran: GhRan): { data: unknown } | { failure: PrFail } => {
+  const f = classifyGh(slug, ran)
+  if (f) return { failure: f }
+  try {
+    return { data: JSON.parse((ran as { run: ProcessRunResult }).run.stdout) }
+  } catch {
+    return { failure: { kind: 'stale', reason: 'gh gave an unreadable reply' } }
+  }
+}
+
 // One `gh pr list --head` per branch, so a repository with hundreds of open PRs can't push these off the first
 // page. PRs from forks are dropped: a fork's branch may share a name with one here.
-async function scanPrs($: EngineInterface) {
+const fetchBranch = (slug: string, gh: (...a: string[]) => Promise<GhRan>, b: string) => async () => {
+  const got = ghJson(slug, await gh('pr', 'list', '-R', slug, '--head', b, '--state', 'open', '--limit', '20', '--json', PR_FIELDS))
+  if (!('data' in got)) return got
+  if (!Array.isArray(got.data)) return { failure: { kind: 'stale', reason: 'gh gave an unreadable reply' } as PrFail }
+  const prs: SharedPr[] = []
+  for (const p of got.data as Record<string, unknown>[]) {
+    if (p.isCrossRepository || p.headRefName !== b || prs.some(x => x.number === p.number)) continue
+    prs.push({
+      number: Number(p.number),
+      title: String(p.title ?? '').replace(/\s+/g, ' ').trim(),
+      url: String(p.url ?? ''),
+      branch: b,
+      draft: Boolean(p.isDraft),
+      conflict: p.mergeable === 'CONFLICTING',
+      base: String(p.baseRefName ?? ''),
+      rollup: p.statusCheckRollup,
+    })
+  }
+  return { data: prs }
+}
+
+// The latest runs a push, a dispatch, a release or a schedule started, each with its jobs. A run whose jobs
+// can't be read keeps the jobs last read for it.
+const fetchRuns = (slug: string, gh: (...a: string[]) => Promise<GhRan>) => async (before: CiRun[] | null) => {
+  const got = ghJson(slug, await gh('run', 'list', '-R', slug, '--limit', RUN_LIST, '--json', RUN_FIELDS))
+  if (!('data' in got)) return got
+  if (!Array.isArray(got.data)) return { failure: { kind: 'stale', reason: 'gh gave an unreadable reply' } as PrFail }
+  const picked = pickRuns(got.data as Record<string, unknown>[], Date.now())
+  const jobs = await Promise.all(picked.map(r => gh('run', 'view', String(r.databaseId), '-R', slug, '--json', 'jobs')))
+  const runs: CiRun[] = picked.map((r, i) => {
+    const id = Number(r.databaseId)
+    const answer = ghJson(slug, jobs[i] as GhRan)
+    return {
+      id,
+      workflow: String(r.workflowName ?? ''),
+      url: String(r.url ?? ''),
+      checks: withRunResult(
+        'data' in answer ? jobChecks((answer.data as { jobs?: unknown } | null)?.jobs) : (before?.find(x => x.id === id)?.checks ?? null),
+        String(r.status ?? ''),
+        String(r.conclusion ?? ''),
+      ),
+      ...(r.status === 'completed' ? { doneAt: Date.parse(String(r.updatedAt)) } : {}),
+    }
+  })
+  return { data: runs }
+}
+
+let prsRunning = false
+let prsAgain = false
+// The fetches this session has running, by file.
+const fetching = new Set<string>()
+let prsShown = ''
+let prsLogged = ''
+
+async function refreshPrs($: EngineInterface) {
+  if (prsRunning) {
+    prsAgain = true
+    return
+  }
+  prsRunning = true
+  try {
+    do {
+      prsAgain = false
+      await syncPrs($)
+    } while (prsAgain)
+  } catch (err) {
+    $.ui.log(`fleet-street: PR refresh failed: ${err}`)
+  } finally {
+    prsRunning = false
+  }
+}
+
+async function setPrs($: EngineInterface, next: PrState | null) {
+  const key = JSON.stringify(next)
+  if (key !== prsShown) {
+    prsShown = key
+    await update($, prs, () => next)
+  }
+}
+
+// Reads the shared files this session needs, draws from them, and sets out to fetch the ones that are due.
+// Called every few seconds, at a turn's end and when the branches change; it never waits for GitHub: a
+// fetch, once its answer is written, calls this again.
+async function syncPrs($: EngineInterface) {
   const ctx = repoContext
-  const key = contextKey(ctx)
   if (!workVisible || ctx === null || ctx.slug === null) {
-    prsFor = ''
-    prsDueAt = Date.now() + PR_SLOW_MS
     await setPrs($, null)
     return
   }
   const slug = ctx.slug
-  const repo = `${ctx.top}\0${slug}`
-  const shown = await read($, prs)
-  const sameRepo = repo === prsFor
-  // Only the branches changed: keep what's known for those still here until the answer lands.
-  if (repo === prsFor && shown?.kind === 'ok') {
-    await setPrs($, { ...shown, prs: shown.prs.filter(p => ctx.branches.includes(p.branch)) })
-  } else if (repo !== prsFor) {
-    prsFor = repo
-    await setPrs($, { kind: 'loading' })
-  }
+  const key = contextKey(ctx)
+  const folder = await repoFolder($, slug)
+  const t = Date.now()
 
-  const gh = (...args: string[]) =>
-    $.process
-      .run(['gh', ...args], { cwd: ctx.top, timeoutMs: 15_000, env: { GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' } })
-      .then(run => ({ run }), err => ({ error: String(err) }))
-  const [answers, milestones, runList] = await Promise.all([
-    mapLimit(ctx.branches, 4, b => gh('pr', 'list', '-R', slug, '--head', b, '--state', 'open', '--limit', '20', '--json', PR_FIELDS)),
-    gh('api', `repos/${slug}/milestones?state=open&per_page=100`),
-    gh('run', 'list', '-R', slug, '--limit', RUN_LIST, '--json', RUN_FIELDS),
-  ])
-  // The repository or branches changed while gh ran; the refresh that change asked for follows.
-  if (contextKey(repoContext) !== key) return
-
-  const found: (Pr & { base: string; rollup: unknown })[] = []
-  let failed: PrFail | null = null
-  // An unavailable answer outranks a rate limit, which outranks a passing failure.
-  const rank = { unavailable: 3, rate: 2, stale: 1 }
-  for (const [i, ran] of answers.entries()) {
-    const branchName = ctx.branches[i] as string
-    let f = classifyGh(slug, ran)
-    if (f === null && 'run' in ran) {
-      try {
-        const list = JSON.parse(ran.run.stdout) as Record<string, unknown>[]
-        for (const p of list) {
-          if (p.isCrossRepository || p.headRefName !== branchName || found.some(x => x.number === p.number)) continue
-          found.push({
-            number: Number(p.number),
-            title: String(p.title ?? '').replace(/\s+/g, ' ').trim(),
-            url: String(p.url ?? ''),
-            branch: branchName,
-            draft: Boolean(p.isDraft),
-            conflict: p.mergeable === 'CONFLICTING',
-            checks: null,
-            base: String(p.baseRefName ?? ''),
-            rollup: p.statusCheckRollup,
-          })
-        }
-      } catch {
-        f = { kind: 'stale', reason: 'gh gave an unreadable reply' }
-      }
-    }
-    if (f && (!failed || rank[f.kind] > rank[failed.kind])) failed = f
-  }
-  // The milestone and the runs are extras: when gh can't answer for them (a repository with issues turned
-  // off, say), the PRs still show and these keep what they last showed.
-  const extra = (ran: { run: ProcessRunResult } | { error: string }): unknown => {
-    let f = classifyGh(slug, ran)
-    if (f === null && 'run' in ran) {
-      try {
-        return JSON.parse(ran.run.stdout)
-      } catch {
-        f = { kind: 'stale', reason: 'gh gave an unreadable reply' }
-      }
-    }
-    if (f && f.reason !== extrasLogged) {
-      extrasLogged = f.reason
-      $.ui.log(`fleet-street: runs or milestone unavailable: ${f.reason}`)
-    }
-    return undefined
-  }
-  const before = shown?.kind === 'ok' && sameRepo ? shown : null
-
-  // The checks each PR's base requires, so one whose workflows never started doesn't pass on the few that did.
-  // Each source is asked every REQUIRED_MS, whether its last answer came or not. When neither has answered for
-  // REQUIRED_KEEP_MS (no access to the rules, say), the PR's checks go by what reported, as before.
-  const parsed = (ran: { run: ProcessRunResult } | { error: string }): unknown => {
-    if (classifyGh(slug, ran) !== null || !('run' in ran)) return undefined
-    try {
-      return JSON.parse(ran.run.stdout)
-    } catch {
-      return undefined
-    }
-  }
-  const sources = [
-    { id: 'rules', path: (b: string) => `repos/${slug}/rules/branches/${encodeURIComponent(b)}`, names: rulesetNames },
-    { id: 'classic', path: (b: string) => `repos/${slug}/branches/${encodeURIComponent(b)}`, names: classicNames },
-  ]
-  const requiredKey = (base: string, source: string) => `${slug}\0${base}\0${source}`
+  const branchFiles = ctx.branches.map(b => ({ branch: b, path: `${folder}/${fileName('pr', b)}` }))
+  const milestonesPath = `${folder}/milestones.json`
+  const runsPath = `${folder}/runs.json`
+  const branchAnswers = await Promise.all(branchFiles.map(f => readShared<SharedPr[]>($, f.path)))
+  const milestones = await readShared<Record<string, unknown>[]>($, milestonesPath)
+  const runsAnswer = await readShared<CiRun[]>($, runsPath)
+  const found = branchAnswers.flatMap((s, i) => (s?.data ?? []).filter(p => p.branch === branchFiles[i]?.branch))
   const bases = [...new Set(found.map(p => p.base).filter(Boolean))]
-  await Promise.all(
-    bases.flatMap(b =>
-      sources.map(async s => {
-        const k = requiredKey(b, s.id)
-        const known = requiredKnown.get(k)
-        if (known && Date.now() - known.askedAt < REQUIRED_MS) return
-        const askedAt = Date.now()
-        requiredKnown.set(k, { names: known?.names ?? [], readAt: known?.readAt ?? 0, askedAt })
-        const answer = parsed(await gh('api', s.path(b)))
-        if (answer !== undefined) requiredKnown.set(k, { names: s.names(answer), readAt: Date.now(), askedAt })
-      }),
-    ),
-  )
+  const requiredFiles = bases.flatMap(b => REQUIRED_SOURCES.map(s => ({ base: b, source: s, path: `${folder}/${fileName(`required-${s.id}`, b)}` })))
+  const requiredAnswers = await Promise.all(requiredFiles.map(f => readShared<string[]>($, f.path)))
   if (contextKey(repoContext) !== key) return
+
+  // Draw. The PRs go by what each branch's file last held; the row is stale while any of them has failed since
+  // or is too old, and unavailable when none has an answer and one says GitHub can't give one.
   const requiredFor = (base: string) => [
     ...new Set(
-      sources.flatMap(s => {
-        const known = requiredKnown.get(requiredKey(base, s.id))
-        return known && Date.now() - known.readAt < REQUIRED_KEEP_MS ? known.names : []
+      requiredFiles.flatMap((f, i) => {
+        const s = requiredAnswers[i]
+        return f.base === base && s?.data && t - s.at < REQUIRED_KEEP_MS ? s.data : []
       }),
     ),
   ]
   const prsFound: Pr[] = found.map(({ base, rollup, ...p }) => ({ ...p, checks: summariseChecks(rollup, requiredFor(base)) }))
-
-  const milestoneList = extra(milestones)
-  const milestone = Array.isArray(milestoneList)
-    ? pickMilestone(milestoneList as Record<string, unknown>[], milestoneName)
-    : (before?.milestone ?? null)
-  const runsFound = extra(runList)
-  const picked = Array.isArray(runsFound) ? pickRuns(runsFound as Record<string, unknown>[], Date.now()) : null
-  const jobs = await Promise.all((picked ?? []).map(r => gh('run', 'view', String(r.databaseId), '-R', slug, '--json', 'jobs')))
-  if (contextKey(repoContext) !== key) return
-  const runs: CiRun[] =
-    picked === null
-      ? (before?.runs ?? [])
-      : picked.map((r, i) => {
-          const id = Number(r.databaseId)
-          const answer = extra(jobs[i] as { run: ProcessRunResult } | { error: string }) as { jobs?: unknown } | undefined
-          return {
-            id,
-            workflow: String(r.workflowName ?? ''),
-            url: String(r.url ?? ''),
-            checks: withRunResult(
-              answer ? jobChecks(answer.jobs) : (before?.runs?.find(x => x.id === id)?.checks ?? null),
-              String(r.status ?? ''),
-              String(r.conclusion ?? ''),
-            ),
-            ...(r.status === 'completed' ? { doneAt: Date.parse(String(r.updatedAt)) } : {}),
-          }
-        })
-
-  const now = Date.now()
-  if (failed === null) {
+  const answered = branchAnswers.filter((s): s is Shared<SharedPr[]> => s !== null && s.at > 0)
+  const failure = branchAnswers.find(s => s?.failure && s.failedAt > s.at)?.failure ?? null
+  const runList = runsAnswer?.data ?? []
+  const shownMilestone = Array.isArray(milestones?.data) ? pickMilestone(milestones.data, milestoneName) : null
+  if (answered.length === 0 && failure) {
+    if (failure.reason !== prsLogged) {
+      prsLogged = failure.reason
+      $.ui.log(`fleet-street: PRs unavailable: ${failure.reason}`)
+    }
+    await setPrs($, { kind: 'unavailable', reason: failure.reason })
+  } else if (answered.length === 0 && branchFiles.length > 0) {
+    await setPrs($, { kind: 'loading' })
+  } else {
     prsLogged = ''
-    const running = prsFound.some(p => p.checks?.running) || runs.some(r => r.doneAt === undefined)
-    prsDueAt = now + (running ? PR_FAST_MS : PR_SLOW_MS)
-    await setPrs($, { kind: 'ok', prs: prsFound, runs, milestone, stale: false })
-    return
+    const stale = failure !== null || answered.some(s => t - s.at >= SHARED_STALE_MS)
+    await setPrs($, { kind: 'ok', prs: prsFound, runs: runList, milestone: shownMilestone, stale })
   }
-  if (failed.reason !== prsLogged) {
-    prsLogged = failed.reason
-    $.ui.log(`fleet-street: PRs unavailable: ${failed.reason}`)
+
+  // Fetch what's due, unless a rate-limit reply holds every fetch off.
+  const backoff = await $.fs
+    .read(await backoffFile($))
+    .then(text => Number((JSON.parse(text) as { until?: unknown }).until) || 0)
+    .catch(() => 0)
+  if (t < backoff) return
+  const gh = (...args: string[]) =>
+    $.process
+      .run(['gh', ...args], { cwd: ctx.top, timeoutMs: 15_000, env: { GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' } })
+      .then(run => ({ run }), err => ({ error: String(err) }))
+  const pace = (running: boolean) => (running ? PR_FAST_MS : PR_SLOW_MS)
+  const due: { path: string; run: () => Promise<void> }[] = []
+  branchFiles.forEach((f, i) => {
+    const s = branchAnswers[i] ?? null
+    const running = (s?.data ?? []).some(p => summariseChecks(p.rollup)?.running)
+    if (isDue(s, pace(running), t)) due.push({ path: f.path, run: () => fetchShared($, f.path, fetchBranch(slug, gh, f.branch)) })
+  })
+  if (isDue(milestones, PR_SLOW_MS, t)) {
+    due.push({
+      path: milestonesPath,
+      run: () =>
+        fetchShared($, milestonesPath, async () => {
+          const got = ghJson(slug, await gh('api', `repos/${slug}/milestones?state=open&per_page=100`))
+          return 'data' in got && !Array.isArray(got.data) ? { failure: { kind: 'stale', reason: 'gh gave an unreadable reply' } } : (got as { data: Record<string, unknown>[] } | { failure: PrFail })
+        }),
+    })
   }
-  prsDueAt = now + (failed.kind === 'rate' ? PR_BACKOFF_MS : PR_SLOW_MS)
-  if (failed.kind === 'rate') prsBackoffUntil = prsDueAt
-  const current = await read($, prs)
-  await setPrs(
-    $,
-    failed.kind !== 'unavailable' && current?.kind === 'ok'
-      ? { ...current, stale: true }
-      : { kind: 'unavailable', reason: failed.reason },
-  )
+  if (isDue(runsAnswer, pace(runList.some(r => r.doneAt === undefined)), t)) {
+    due.push({ path: runsPath, run: () => fetchShared($, runsPath, fetchRuns(slug, gh)) })
+  }
+  requiredFiles.forEach((f, i) => {
+    if (!isDue(requiredAnswers[i] ?? null, REQUIRED_MS, t)) return
+    due.push({
+      path: f.path,
+      run: () =>
+        fetchShared($, f.path, async () => {
+          const got = ghJson(slug, await gh('api', f.source.path(slug, f.base)))
+          return 'data' in got ? { data: f.source.names(got.data) } : got
+        }),
+    })
+  })
+  for (const d of due) {
+    if (fetching.size >= FETCHES) break
+    if (fetching.has(d.path)) continue
+    fetching.add(d.path)
+    void d
+      .run()
+      .catch(err => logCache($, `fetch failed: ${err}`))
+      .finally(() => {
+        fetching.delete(d.path)
+        void refreshPrs($)
+      })
+  }
 }
 
 async function setTimer($: EngineInterface, start: number) {
@@ -1175,7 +1250,8 @@ export const register: Register = (on, options) => {
       if (Math.floor(t / 1000) % 5 === 0) void refreshLocal($)
       // A safety net: subagents are refreshed as their steps and turns come.
       if (Math.floor(t / 1000) % 5 === 0) void refreshAgents($)
-      if (workVisible && t >= prsDueAt) void refreshPrs($)
+      // The shared files are read every five seconds; what they say decides when GitHub is asked.
+      if (workVisible && Math.floor(t / 1000) % 5 === 0) void refreshPrs($)
       if (Math.floor(t / 1000) % 15 === 0) void refreshRecent($).catch(() => {})
       const left = lastAt === null ? Infinity : lastAt + ttl - t
       const key = left > 0 && left <= FINAL_COUNTDOWN_MS ? `s${Math.floor(t / 1000)}` : `m${Math.floor(t / 60_000)}:${left > 0}`
@@ -1304,7 +1380,7 @@ export const register: Register = (on, options) => {
       await markActive($, at)
       // Not awaited: a slow git or gh never holds up the turn.
       void refreshLocal($)
-      if (workVisible && at - prsStartedAt >= PR_TURN_MS && at >= prsBackoffUntil) void refreshPrs($)
+      if (workVisible) void refreshPrs($)
     } else {
       // A subagent's turn ended: it may have finished.
       void refreshAgents($)

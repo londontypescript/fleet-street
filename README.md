@@ -62,9 +62,9 @@ Usage and Status Banner Plugin for Claude
     reported yet; while any haven't and none failed or runs, it shows `○ 4/15` in yellow. A red `⚠` after the
     title means the PR conflicts with its base: GitHub doesn't start the workflows a `pull_request` event runs
     until the conflict is resolved, so those checks never come. A draft is dimmed. Clicking a title opens
-    the PR; it shows as a button on hover. PRs from forks are left out. It checks GitHub every 15 seconds
-    while any checks are running, every 60 seconds otherwise, and at once when the branch or the worktrees
-    change. It needs `gh`, signed in, and an `origin` remote on github.com; when `gh` can't answer there's no
+    the PR; it shows as a button on hover. PRs from forks are left out. Each branch's PRs are asked for
+    every 15 seconds while any of their checks are running, every 60 seconds otherwise, and at once for a new
+    branch. It needs `gh`, signed in, and an `origin` remote on github.com; when `gh` can't answer there's no
     row. If a refresh fails after one has worked (offline, say), the last list stays, dimmed. Squeezed: titles
     cut to 32, then 16, then left out, then `×N` with the worst mark. A failed check is named after the count
     (`✗ 3/4 windows`), the first two at full width and the first one once squeezed, before the titles are cut
@@ -76,6 +76,12 @@ Usage and Status Banner Plugin for Claude
     or was cancelled is marked failed whatever its jobs say. A run stays while it runs and for ten minutes
     after it finishes; at most three. Read with `pr`'s refresh, at its faster pace while one runs. Squeezed:
     names cut to 24, then 12, then the failed names left out, then `×N` with the worst mark
+- **Shared with every session**: what GitHub says (each branch's PRs, the milestones, the runs, the required
+  checks) is kept in small files under `~/.claude/fleet-street/github/<owner>__<repo>/` (under
+  `CLAUDE_CONFIG_DIR` when that's set), and every session reads them every five seconds. A session asks GitHub
+  only for what's due and that no other session has set out to fetch in the last 30 seconds, so ten sessions
+  on one repository cost what one does. A rate-limit reply holds every session off GitHub for five minutes. A
+  failed fetch is tried again after a minute; an answer more than five minutes old shows dimmed.
 - **Recent sessions**, the last row, off unless turned on: the three most recently active other sessions in the
   desktop app, from any project, each in its own box with its title and how long ago it was last active.
   Clicking a title opens that session. `/toggle-sessions` shows or hides the row for the session, and
