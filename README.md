@@ -44,11 +44,13 @@ Usage and Status Banner Plugin for Claude
     on a Mac only; it isn't started to ask. The first time, macOS asks whether Claude may control Music
     (System Settings → Privacy & Security → Automation); until it's allowed, the date shows
   - Right: `time`, how long the session has been running
-  - The track is cut to the room the two sides leave: the title is cut and the artist kept whole
+  - With a diff showing, the track (or the date and time) sits on the right beside `time`, away from the
+    diff; without one it's centred
+  - The track is cut to the room left: the title is cut and the artist kept whole
     (`♪ Let's Go (feat. Yelawolf, Twi… — Trick Daddy`), and only with under 8 characters left for the title is
-    the artist cut too. When the row runs out of room, the file count is left out (while keeping it would cut
-    the track under 24 characters), then the date (keeping the time), then the middle (a track that would be
-    cut under 16 characters), then the diff
+    the artist cut too. The file count always shows with the diff. When the row runs out of room, the date is
+    left out (keeping the time), then the middle (a track that would be cut under 16 characters), then the
+    diff
 - **The list rows** below it each appear only while they have something to show, so a quiet session is three
   rows tall. Rows have a blank line between them while they all fit in the space the app gives the banner
   (at most half the terminal); when they wouldn't, they're packed tight. Each is a label and its entries; when a row runs out of room it is squeezed a step at a time, as

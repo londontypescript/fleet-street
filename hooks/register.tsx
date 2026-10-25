@@ -2038,24 +2038,26 @@ export const register: Register = (on, options) => {
       ) : null
 
     // Row 3: the branch with its diff against the main branch beside it (`8 files +152 −32`, uncommitted work
-    // included), in the middle the track Apple Music is playing (`♪ Song — Artist`) or else the date and time
-    // (`Sat 25 Oct 18:42`), and the session time on the right. The track is cut to the room the sides leave. When
-    // the row runs out of room the file count is left out (while it would leave the track under 24 cells), then
-    // the date (keeping the time), then the middle (a track under 12 cells), then the diff.
+    // included), the track Apple Music is playing (`♪ Song — Artist`) or else the date and time
+    // (`Sat 25 Oct 18:42`), and the session time on the right. With a diff the track or the date sits on the
+    // right beside the time, away from the diff; without one it's centred. The track is cut to the room left.
+    // When the row runs out of room the date is left out (keeping the time), then the middle (a track under 16
+    // cells), then the diff.
     const elapsed = started !== null ? fmtElapsed(t - started) : null
     const diffShown = workOn && diffState?.kind === 'ok' && !diffState.clean
     const filesText = diffState?.kind === 'ok' ? `${diffState.files} ${diffState.files === 1 ? 'file' : 'files'}` : ''
     const diffNumbers = diffState?.kind === 'ok' ? [`+${diffState.added}`, `−${diffState.deleted}`] : []
     const branchText = onBranch ? `⎇ ${onBranch}` : ''
-    // How much of the diff is drawn: the file count and the lines, the lines alone, or none.
-    type DiffShape = 'files' | 'lines' | null
-    // The branch, and with the diff two columns and its parts a column apart; `time 26m`. With something in the
-    // middle both sides take the wider one's columns, so the middle sits at the true centre: two sides, a column
-    // either side of the middle, and the middle.
+    // Whether the diff is drawn: the file count and the lines, or none.
+    type DiffShape = 'files' | null
+    // The branch, and with the diff two columns and its parts a column apart; `time 26m`. Centred, the middle
+    // has both sides take the wider one's columns, so it sits at the true centre: two sides, a column either
+    // side of the middle, and the middle. On the right, it's the left side, a column, the middle, two columns
+    // and the time.
     // A branch other than the main one is bold, which a desktop draws wider than its usual share: it's counted
     // at full width, like the gaps.
     const leftWidth = (d: DiffShape): Width => {
-      const shown = d === null ? [] : d === 'files' ? [filesText, ...diffNumbers] : diffNumbers
+      const shown = d === null ? [] : [filesText, ...diffNumbers]
       const boldBranch = onBranch !== null && onBranch !== mainBranch
       return {
         text: (boldBranch ? 0 : cells(branchText)) + shown.reduce((w, x) => w + cells(x), 0),
@@ -2065,9 +2067,11 @@ export const register: Register = (on, options) => {
     const rightWidth: Width = { text: elapsed ? 4 + cells(elapsed) : 0, gaps: elapsed ? 1 : 0 }
     const columns = (w: Width) => Math.ceil(w.text * scale) + w.gaps
     const sideColumns = (d: DiffShape) => Math.max(columns(leftWidth(d)), columns(rightWidth))
+    // The columns a middle has around it: beside a diff it's on the right, else centred.
+    const aroundMiddle = (d: DiffShape) => (d === null ? 2 * sideColumns(d) + 2 : columns(leftWidth(d)) + 1 + 2 + columns(rightWidth))
     // The middle's shapes beside a diff shape, widest first: each its parts a column apart. The track is cut to
-    // the cells left between the two sides, less its mark (two cells: it's counted wide) and the gap after it;
-    // under `least` cells, none.
+    // the cells left around it, less its mark (two cells: it's counted wide) and the gap after it; under 16
+    // cells, none.
     const clock = new Date(t)
     const hhmm = `${String(clock.getHours()).padStart(2, '0')}:${String(clock.getMinutes()).padStart(2, '0')}`
     // The track in so many cells: the title cut first, keeping the artist whole while the title keeps 8 cells;
@@ -2080,33 +2084,27 @@ export const register: Register = (on, options) => {
       if (room - cells(by) >= 8) return `${truncate(playing.title, room - cells(by))}${by}`
       return `${truncate(playing.title, 8)} — ${truncate(playing.artist, room - 8 - 3)}`
     }
-    const middleShapes = (d: DiffShape, least: number): Part[][] => {
+    const middleShapes = (d: DiffShape): Part[][] => {
       if (!playing) {
         return [
           [{ text: `${DAYS[clock.getDay()]} ${clock.getDate()} ${MONTHS[clock.getMonth()]}`, dim: true }, { text: hhmm }],
           [{ text: hhmm }],
         ]
       }
-      const room = Math.floor((e.props.bodyColumns - 2 * sideColumns(d) - 2 - 1) / scale) - cells('♪')
-      return room >= least ? [[{ text: '♪', color: 'magenta' }, { text: trackIn(room) }]] : []
+      const room = Math.floor((e.props.bodyColumns - aroundMiddle(d) - 1) / scale) - cells('♪')
+      return room >= 16 ? [[{ text: '♪', color: 'magenta' }, { text: trackIn(room) }]] : []
     }
     const middleWidth = (m: Part[] | null): Width =>
       m ? { text: m.reduce((w, x) => w + cells(x.text), 0), gaps: m.length - 1 } : { text: 0, gaps: 0 }
     const row3Fits = (d: DiffShape, m: Part[] | null) => {
       if (m === null) return columns(leftWidth(d)) + 1 + columns(rightWidth) <= e.props.bodyColumns
       const mid = middleWidth(m)
-      return 2 * sideColumns(d) + 2 + mid.text * scale + mid.gaps <= e.props.bodyColumns
+      return aroundMiddle(d) + mid.text * scale + mid.gaps <= e.props.bodyColumns
     }
     const row3Fit = [
       ...(diffShown
-        ? [
-            ...middleShapes('files', 24)
-              .slice(0, 1)
-              .map(m => ({ diff: 'files' as DiffShape, middle: m })),
-            ...middleShapes('lines', 16).map(m => ({ diff: 'lines' as DiffShape, middle: m })),
-            { diff: 'lines' as DiffShape, middle: null },
-          ]
-        : middleShapes(null, 16).map(m => ({ diff: null as DiffShape, middle: m }))),
+        ? [...middleShapes('files').map(m => ({ diff: 'files' as DiffShape, middle: m })), { diff: 'files' as DiffShape, middle: null }]
+        : middleShapes(null).map(m => ({ diff: null as DiffShape, middle: m }))),
       { diff: null, middle: null },
     ].find(c => row3Fits(c.diff, c.middle)) ?? { diff: null, middle: null }
     const middlePart = row3Fit.middle ? (
@@ -2120,7 +2118,7 @@ export const register: Register = (on, options) => {
     ) : null
     const diffPart = row3Fit.diff ? (
       <Box flexWrap="nowrap" columnGap={1}>
-        {row3Fit.diff === 'files' ? <Text dimColor>{filesText}</Text> : null}
+        <Text dimColor>{filesText}</Text>
         <Text color="green">{diffNumbers[0]}</Text>
         <Text color="red">{diffNumbers[1]}</Text>
       </Box>
@@ -2144,7 +2142,15 @@ export const register: Register = (on, options) => {
       </Box>
     ) : null
     const side = sideColumns(row3Fit.diff)
-    const statusLine = middlePart ? (
+    const statusLine = middlePart && row3Fit.diff ? (
+      <Box width="100%" flexWrap="nowrap" justifyContent="space-between" columnGap={1}>
+        {branchPart}
+        <Box flexWrap="nowrap" columnGap={2}>
+          {middlePart}
+          {timePart}
+        </Box>
+      </Box>
+    ) : middlePart ? (
       <Box width="100%" flexWrap="nowrap" columnGap={1}>
         <Box width={side} flexShrink={0} flexWrap="nowrap">
           {branchPart}
