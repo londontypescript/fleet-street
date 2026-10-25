@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ProcessRunResult, Register, RenderChildren } from 'claude-code'
 
-import type { Away, BgTask, Checks, CiRun, Context, DiffState, Limit, Milestone, Pr, PrState, RecentSession, Subagent, Worktree } from '../types'
+import type { Away, BgTask, Checks, CiRun, Context, DiffState, Limit, Milestone, NowPlaying, Pr, PrState, RecentSession, RepoName, SubSession, Subagent, Worktree } from '../types'
 
 const limits = atom({ plugin: 'fleet-street', key: 'limits' } as const, [] as Limit[])
 const context = atom({ plugin: 'fleet-street', key: 'context' } as const, null as Context | null)
@@ -21,6 +21,13 @@ const branch = atom({ plugin: 'fleet-street', key: 'branch' } as const, null as 
 // The three most recently updated other sessions, across every project, newest first; null until a scan
 // finds the desktop app's session records (never, on a machine without the desktop app).
 const recent = atom({ plugin: 'fleet-street', key: 'recent' } as const, null as RecentSession[] | null)
+// The desktop sessions this one started, not archived, in the order they were made; null without the desktop app
+// or before this session's own record is found.
+const subs = atom({ plugin: 'fleet-street', key: 'subs' } as const, null as SubSession[] | null)
+// The track Apple Music is playing; null while it plays nothing, or off a Mac.
+const nowPlaying = atom({ plugin: 'fleet-street', key: 'nowPlaying' } as const, null as NowPlaying | null)
+// The repository (or folder) the top row names; null until the first local refresh.
+const repoName = atom({ plugin: 'fleet-street', key: 'repoName' } as const, null as RepoName | null)
 // This session's choice from /toggle-sessions; null follows the showSessions option.
 const sessionsShown = atom({ plugin: 'fleet-street', key: 'sessionsShown' } as const, null as boolean | null)
 // The open PRs from this session's branch and the worktrees' branches; null when the repository isn't on GitHub.
@@ -86,6 +93,10 @@ const filledCells = (pct: number) => Math.min(BAR_WIDTH, Math.round((pct / 100) 
 const LABELS: Record<string, string> = { five_hour: '5h', seven_day: 'week', spend_limit: 'spend' }
 
 const FINAL_COUNTDOWN_MS = 5 * 60 * 1000
+
+// Row 3's date, in the machine's own time zone: `Sat 25 Oct`.
+const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 // m:ss in the final five minutes, whole minutes before that.
 const fmtCacheLeft = (ms: number) =>
@@ -340,8 +351,15 @@ type SessionRecord = {
   id: string
   cliId?: string
   title: string
+  createdAt: number
   updatedAt: number
   archived: boolean
+  cwd?: string
+  // The desktop session that started this one, when one did, and the short name it was started with.
+  parent?: string
+  spawnName?: string
+  // Its last turn ended blocked on the person (the turn's wrap-up said so).
+  needsUser: boolean
 }
 const records = new Map<string, { mtimeMs: number; record: SessionRecord | null }>()
 const realPaths = new Map<string, string>()
@@ -364,8 +382,14 @@ const parseRecord = (text: string): SessionRecord | null => {
       id: s.sessionId,
       cliId: typeof s.cliSessionId === 'string' ? s.cliSessionId : undefined,
       title: String(s.title || 'Untitled').split(/\s+/).filter(Boolean).join(' '),
+      createdAt: Number(s.createdAt ?? at),
       updatedAt: Number(at),
       archived: Boolean(s.isArchived),
+      cwd: typeof s.cwd === 'string' ? s.cwd : undefined,
+      parent: typeof s.spawnedFrom?.sessionId === 'string' ? s.spawnedFrom.sessionId : undefined,
+      spawnName: typeof s.spawnedFrom?.name === 'string' && s.spawnedFrom.name ? s.spawnedFrom.name : undefined,
+      // The wrap-up holds the question it put to the person (true in older records).
+      needsUser: Boolean(s.turnWrapUp?.needsUser),
     }
   } catch {
     return null
@@ -412,18 +436,16 @@ async function refreshRecent($: EngineInterface) {
   }
 }
 
-async function scanRecent($: EngineInterface) {
+// The desktop app's own session records (<root>/<account>/<org>/local_*.json). Only files changed since the
+// last read are read again. null when there's no desktop app.
+async function readRecords($: EngineInterface): Promise<SessionRecord[] | null> {
   if (sessionsRoot === undefined || sessionsRoot === null) sessionsRoot = await findSessionsRoot($)
-  if (sessionsRoot === null) {
-    if ((await read($, recent)) !== null) await update($, recent, () => null)
-    return
-  }
+  if (sessionsRoot === null) return null
   const { path: root } = sessionsRoot
-  const current = await $.session.id()
   const dirsOf = async (path: string) =>
     (await $.fs.list(path).catch(() => [])).filter(d => d.kind === 'dir').map(d => `${path}/${d.name}`)
 
-  const found: RecentSession[] = []
+  const found: SessionRecord[] = []
   const seen = new Set<string>()
   for (const account of await dirsOf(root)) {
     for (const org of await dirsOf(account)) {
@@ -437,18 +459,232 @@ async function scanRecent($: EngineInterface) {
           cached = { mtimeMs: f.mtimeMs, record: text === null ? null : parseRecord(text) }
           records.set(path, cached)
         }
-        const r = cached.record
-        if (!r || r.archived || (r.cliId !== undefined && r.cliId === current)) continue
-        found.push({ id: r.id, title: r.title, updatedAt: r.updatedAt, link: `claude://claude.ai/epitaxy/${r.id}` })
+        if (cached.record) found.push(cached.record)
       }
     }
   }
   for (const path of records.keys()) if (!seen.has(path)) records.delete(path)
+  return found
+}
+
+// The latest unarchived sessions other than this one, whatever their folder. With no desktop app the list is
+// null and the row is not drawn.
+async function scanRecent($: EngineInterface) {
+  const list = await readRecords($)
+  if (list === null) {
+    if ((await read($, recent)) !== null) await update($, recent, () => null)
+    return
+  }
+  const current = await $.session.id()
+  const found = list
+    .filter(r => !r.archived && !(r.cliId !== undefined && r.cliId === current))
+    .map(r => ({ id: r.id, title: r.title, updatedAt: r.updatedAt, link: `claude://claude.ai/epitaxy/${r.id}` }))
 
   const next = found.sort((a, b) => b.updatedAt - a.updatedAt).slice(0, RECENT_COUNT)
   const key = (list: RecentSession[] | null) => (list ?? []).map(r => `${r.id}|${r.title}|${r.updatedAt}`).join()
   const shown = await read($, recent)
   if (shown === null || key(next) !== key(shown)) await update($, recent, () => next)
+}
+
+let subsRunning = false
+let subsShown: string | undefined
+
+// The desktop sessions this one started (their records name it as the one they were spawned from), not
+// archived, each with what it's doing. null when there's no desktop app or this session has no record there
+// (a terminal session).
+async function refreshSubs($: EngineInterface) {
+  if (subsRunning) return
+  subsRunning = true
+  try {
+    const list = await readRecords($)
+    const current = await $.session.id()
+    const own = list?.find(r => r.cliId === current)
+    let next: SubSession[] | null = null
+    if (list && own) {
+      next = []
+      for (const r of list.filter(r => r.parent === own.id && !r.archived).sort((a, b) => a.createdAt - b.createdAt)) {
+        const { status, lastAt } = await subStatus($, r)
+        next.push({ id: r.id, name: r.spawnName ?? r.title, link: `claude://claude.ai/epitaxy/${r.id}`, status, lastAt })
+      }
+    }
+    const key = JSON.stringify(next)
+    if (key !== subsShown) {
+      subsShown = key
+      await update($, subs, () => next)
+    }
+  } finally {
+    subsRunning = false
+  }
+}
+
+// A sub-session mid-turn is working, unless the turn is held on a question for the person; one between turns
+// is waiting, unless its turn ended blocked on the person. It last did anything when its record or its
+// transcript last changed (the record isn't written mid-turn).
+async function subStatus($: EngineInterface, r: SessionRecord): Promise<Pick<SubSession, 'status' | 'lastAt'>> {
+  const turn = r.cliId && r.cwd ? await transcriptTurn($, r.cliId, r.cwd) : null
+  const lastAt = Math.max(r.updatedAt, (r.cliId && turns.get(r.cliId)?.mtimeMs) || 0)
+  // A turn gone still mid-way didn't end in a wrap-up, so the record's flag is an older turn's.
+  const status =
+    turn?.turn === 'asking' ? 'needsYou' : turn?.turn === 'running' ? 'working' : r.needsUser && !turn?.stale ? 'needsYou' : 'waiting'
+  return { status, lastAt }
+}
+
+// Tools whose call waits on the person: a question, a plan to approve, a session offered rather than started.
+const asksPerson = (tool: { name?: unknown; input?: { initiation?: unknown } }) =>
+  tool.name === 'AskUserQuestion' ||
+  tool.name === 'ExitPlanMode' ||
+  (typeof tool.name === 'string' && tool.name.endsWith('__start_session') && tool.input?.initiation === 'offer')
+
+// A transcript left untouched this long isn't mid-turn whatever its end says: its session stopped without
+// closing the turn (the app quit). A tool call that runs longer reads as waiting.
+const TURN_STALE_MS = 30 * 60_000
+// The end of a transcript is enough to tell where its turn stands; when the end is one entry too large to
+// read whole (a big tool result), more of it is read, up to what a command's output may hold (4 MiB).
+const TRANSCRIPT_TAILS = [64 * 1024, 1024 * 1024, 4 * 1024 * 1024 - 1024]
+
+type Turn = 'running' | 'asking' | 'ended'
+// What each sub-session's transcript said, kept until the file changes; where each transcript is, once found.
+const turns = new Map<string, { mtimeMs: number; size: number; turn: Turn | null }>()
+const transcripts = new Map<string, string>()
+const transcriptMisses = new Map<string, number>()
+
+// Where a session's transcript is: <config>/projects/<its folder, each character other than a letter or a
+// digit made a dash>/<id>.jsonl, else searched for in every project folder (a long path's folder is named
+// otherwise), at most once a minute.
+async function transcriptPath($: EngineInterface, cliId: string, cwd: string) {
+  const known = transcripts.get(cliId)
+  if (known) return known
+  const config = await configRoot($)
+  if (config === null) return null
+  const projects = `${config}/projects`
+  const guess = `${projects}/${cwd.replace(/[^A-Za-z0-9]/g, '-')}/${cliId}.jsonl`
+  let found = (await $.fs.exists(guess)) ? guess : null
+  if (found === null && Date.now() - (transcriptMisses.get(cliId) ?? 0) >= 60_000) {
+    transcriptMisses.set(cliId, Date.now())
+    for (const d of await $.fs.list(projects).catch(() => [])) {
+      const path = `${projects}/${d.name}/${cliId}.jsonl`
+      if (d.kind === 'dir' && (await $.fs.exists(path))) {
+        found = path
+        break
+      }
+    }
+  }
+  if (found) transcripts.set(cliId, found)
+  return found
+}
+
+// stale: a turn that reads as mid-turn but whose transcript has been still too long; it's no longer running.
+async function transcriptTurn($: EngineInterface, cliId: string, cwd: string): Promise<{ turn: Turn | null; stale: boolean } | null> {
+  const path = await transcriptPath($, cliId, cwd)
+  if (!path) return null
+  const stat = await $.fs.stat(path).catch(() => undefined)
+  if (!stat) return null
+  let cached = turns.get(cliId)
+  if (!cached || cached.mtimeMs !== stat.mtimeMs || cached.size !== stat.size) {
+    const turn = await readTurn($, path, stat.size)
+    // A read that failed is tried again next time, not kept.
+    if (turn === undefined) return null
+    cached = { mtimeMs: stat.mtimeMs, size: stat.size, turn }
+    turns.set(cliId, cached)
+  }
+  const stale = cached.turn === 'running' && Date.now() - cached.mtimeMs >= TURN_STALE_MS
+  return { turn: stale ? 'ended' : cached.turn, stale }
+}
+
+// The turn the end of a transcript tells, read with tail and more of it while it tells nothing (its last entry
+// is cut); where there's no tail (Windows) the whole file is read. undefined when it can't be read.
+async function readTurn($: EngineInterface, path: string, size: number): Promise<Turn | null | undefined> {
+  for (const bytes of TRANSCRIPT_TAILS) {
+    const tail = await $.process.run(['tail', '-c', String(bytes), path], { timeoutMs: 5000 }).catch(() => null)
+    if (tail === null || tail.exitCode !== 0) break
+    if (tail.isStdoutTruncated) return undefined
+    const turn = turnOf(tail.stdout)
+    if (turn !== null || size <= bytes) return turn
+  }
+  const text = await $.fs.read(path).catch(() => null)
+  return text === null ? undefined : turnOf(text)
+}
+
+// What Apple Music is playing, asked through AppleScript: the title and the artist a tab apart, nothing while it
+// isn't running (it isn't started to ask) or isn't playing. A stream without a track says nothing too; being
+// refused control of Music fails the script.
+const NOW_PLAYING_SCRIPT = [
+  'if application "Music" is running then',
+  'tell application "Music"',
+  'if player state is playing then',
+  'try',
+  'return (name of current track) & tab & (artist of current track)',
+  'end try',
+  'end if',
+  'end tell',
+  'end if',
+  'return ""',
+]
+let musicRunning = false
+// A failed answer (no osascript off a Mac, or Claude not yet let control Music) is asked again a minute later.
+let musicRetryAt = 0
+let musicShown = ''
+
+async function refreshMusic($: EngineInterface) {
+  if (musicRunning || Date.now() < musicRetryAt) return
+  musicRunning = true
+  try {
+    const ran = await $.process
+      .run(['osascript', ...NOW_PLAYING_SCRIPT.flatMap(line => ['-e', line])], { timeoutMs: 5000 })
+      .catch(() => null)
+    let next: NowPlaying | null = null
+    if (ok(ran)) {
+      const [title = '', artist = ''] = ran.stdout.replace(/\r?\n$/, '').split('\t')
+      if (title.trim()) next = { title: title.trim(), artist: artist.trim() }
+    } else {
+      musicRetryAt = Date.now() + 60_000
+    }
+    const key = JSON.stringify(next)
+    if (key !== musicShown) {
+      musicShown = key
+      await update($, nowPlaying, () => next)
+    }
+  } finally {
+    musicRunning = false
+  }
+}
+
+// Where a transcript's last turn stands. Read in order: a tool call stays open until its result comes, and
+// the stop hooks' summary closes the turn, as does a reply with no tool call or the person's interruption. A
+// turn with an open call that asks the person is held on them (it may have been made beside others, whose
+// results come after it); otherwise the last entry that tells decides: a closing one ends the turn, anything
+// else (a tool call, its result, a prompt) is mid-turn. The first line may be cut, and is skipped.
+const turnOf = (text: string): Turn | null => {
+  const open = new Map<string, Record<string, any>>()
+  let turn: Turn | null = null
+  for (const line of text.split('\n')) {
+    let e: Record<string, any>
+    try {
+      e = JSON.parse(line)
+    } catch {
+      continue
+    }
+    const content = e.message?.content
+    if (e.type === 'system' && e.subtype === 'stop_hook_summary') {
+      open.clear()
+      turn = 'ended'
+    } else if (e.type === 'assistant') {
+      const tools: Record<string, any>[] = Array.isArray(content) ? content.filter(c => c?.type === 'tool_use') : []
+      for (const tool of tools) if (typeof tool.id === 'string') open.set(tool.id, tool)
+      turn = e.message?.stop_reason === 'end_turn' && tools.length === 0 ? 'ended' : 'running'
+    } else if (e.type === 'user') {
+      const results: Record<string, any>[] = Array.isArray(content) ? content.filter(c => c?.type === 'tool_result') : []
+      for (const r of results) open.delete(r.tool_use_id)
+      const said = typeof content === 'string' ? content : Array.isArray(content) ? content.map(c => c?.text ?? '').join('') : ''
+      if (said.startsWith('[Request interrupted by user')) {
+        open.clear()
+        turn = 'ended'
+      } else {
+        turn = 'running'
+      }
+    }
+  }
+  return turn === 'running' && [...open.values()].some(asksPerson) ? 'asking' : turn
 }
 
 // Sessions open through the desktop app's deep link, handed to the OS's own opener.
@@ -505,6 +741,17 @@ let branchShown: string | null | undefined
 let worktreesShown: string | undefined
 let treesKnown: Worktree[] = []
 let diffShown = ''
+let repoNameShown: string | undefined
+
+// The last part of a path, by either separator.
+const baseName = (path: string) => path.split(/[\\/]/).filter(Boolean).pop() ?? path
+
+async function publishRepoName($: EngineInterface, next: RepoName) {
+  const key = JSON.stringify(next)
+  if (key === repoNameShown) return
+  repoNameShown = key
+  await update($, repoName, () => next)
+}
 
 let localRunning = false
 let localAgain = false
@@ -533,6 +780,7 @@ async function scanLocal($: EngineInterface) {
   const cwd = await $.session.cwd()
   const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd, timeoutMs: 5000 }).catch(() => null)
   if (!ok(top)) {
+    await publishRepoName($, { owner: null, name: baseName(cwd), folder: null })
     await publishLocal($, null, [], null, null)
     return
   }
@@ -555,6 +803,10 @@ async function scanLocal($: EngineInterface) {
   const trees = listed ?? treesKnown
   const origin = await git('remote', 'get-url', 'origin')
   const slug = ok(origin) ? githubSlug(origin.stdout) : null
+  // Named by its GitHub repository, with the folder after it when that's named otherwise (a worktree's).
+  const folder = baseName(topPath)
+  const [owner, repo] = slug ? (slug.split('/') as [string, string]) : [null, folder]
+  await publishRepoName($, { owner, name: repo, folder: folder === repo ? null : folder })
   const d = workVisible ? await readDiff(git) : null
   // This session's branch first, then the worktrees' in the order row 2 shows them; detached ones have none.
   const ordered = [onBranch, ...trees.filter(w => !w.agent).map(w => w.branch), ...trees.filter(w => w.agent).map(w => w.branch)]
@@ -617,7 +869,8 @@ async function listWorktrees($: EngineInterface, git: Git, topPath: string): Pro
 // New files' lines are counted for at most this many of them.
 const UNTRACKED_COUNTED = 200
 
-// Lines added and deleted since the branch left the main branch, uncommitted work included: the working tree
+// Lines added and deleted since the branch left the main branch, and the files they're in (a rename counts
+// once), uncommitted work included: the working tree
 // against the merge-base of HEAD and origin/<main> (the local <main> when there's no such remote branch), as
 // the refs stand locally (nothing is fetched). New files count as added lines; binaries as no lines.
 async function readDiff(git: Git): Promise<DiffState> {
@@ -662,7 +915,7 @@ async function readDiff(git: Git): Promise<DiffState> {
       }
     }
   }
-  return { kind: 'ok', added, deleted, clean: files === 0 && untracked.length === 0 }
+  return { kind: 'ok', added, deleted, files: files + untracked.length, clean: files === 0 && untracked.length === 0 }
 }
 
 // PRs are looked up for at most this many branches: this session's, then the worktrees'.
@@ -906,13 +1159,15 @@ const fileName = (kind: string, name: string) => `${kind}-${name.replace(/[^A-Za
 // lower case, as GitHub's names are.
 let cacheRoot: string | undefined
 async function sharedRoot($: EngineInterface) {
-  if (cacheRoot === undefined) {
-    const config = await $.env.get('CLAUDE_CONFIG_DIR')
-    const home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE'))
-    const base = config || (home ? `${home.replace(/[\\/]+$/, '')}/.claude` : `${$.plugin.root}/.cache`)
-    cacheRoot = `${base.replace(/[\\/]+$/, '')}/fleet-street/github`
-  }
+  if (cacheRoot === undefined) cacheRoot = `${(await configRoot($)) ?? `${$.plugin.root}/.cache`}/fleet-street/github`
   return cacheRoot
+}
+// Claude's configuration folder: CLAUDE_CONFIG_DIR, else .claude in the home folder; null with neither.
+async function configRoot($: EngineInterface) {
+  const config = await $.env.get('CLAUDE_CONFIG_DIR')
+  const home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE'))
+  const base = config || (home ? `${home.replace(/[\\/]+$/, '')}/.claude` : null)
+  return base === null ? null : base.replace(/[\\/]+$/, '')
 }
 const repoFolder = async ($: EngineInterface, slug: string) => `${await sharedRoot($)}/${slug.toLowerCase().replace('/', '__')}`
 
@@ -1228,7 +1483,6 @@ export const register: Register = (on, options) => {
   let lastAt: number | null = null
   let ttl = TTL_API_MS
   let drawnKey = ''
-
   on('session.start', async ($, e, next) => {
     const result = await next(e)
     const usage = await $.session.usage()
@@ -1254,6 +1508,8 @@ export const register: Register = (on, options) => {
     void refreshLocal($)
     void refreshAgents($)
     void refreshRecent($).catch(err => $.ui.log(`fleet-street: recent sessions failed: ${err}`))
+    void refreshSubs($).catch(err => $.ui.log(`fleet-street: sub-sessions failed: ${err}`))
+    void refreshMusic($).catch(() => {})
     $.clock.every(1000, () => {
       const t = Date.now()
       // A checkout made outside the session (another terminal) shows within five seconds.
@@ -1263,6 +1519,8 @@ export const register: Register = (on, options) => {
       // The shared files are read every five seconds; what they say decides when GitHub is asked.
       if (workVisible && Math.floor(t / 1000) % 5 === 0) void refreshPrs($)
       if (Math.floor(t / 1000) % 15 === 0) void refreshRecent($).catch(() => {})
+      if (Math.floor(t / 1000) % 5 === 0) void refreshSubs($).catch(() => {})
+      if (Math.floor(t / 1000) % 5 === 0) void refreshMusic($).catch(() => {})
       const left = lastAt === null ? Infinity : lastAt + ttl - t
       const key = left > 0 && left <= FINAL_COUNTDOWN_MS ? `s${Math.floor(t / 1000)}` : `m${Math.floor(t / 60_000)}:${left > 0}`
       if (key !== drawnKey) {
@@ -1420,6 +1678,9 @@ export const register: Register = (on, options) => {
     const sessionsOn = (await read($, sessionsShown)) ?? showSessions
     const prState = await read($, prs)
     const diffState = await read($, diff)
+    const subList = await read($, subs)
+    const repo = await read($, repoName)
+    const playing = await read($, nowPlaying)
 
     // Spacing comes from Box gaps, not spaces inside Text: the desktop surface trims those.
     const sep = <Text dimColor>│</Text>
@@ -1511,7 +1772,7 @@ export const register: Register = (on, options) => {
     type Width = { text: number; gaps: number }
     const fits = (w: Width) => w.text * scale + w.gaps <= e.props.bodyColumns
 
-    // The list rows (ag, bg, wt, pr, ci) are drawn only when they have something. Each is a label and its entries,
+    // The list rows (subs, ag, bg, wt, pr, ci) are drawn only when they have something. Each is a label and its entries,
     // squeezed one step at a time until the row fits, and left out when even the last step doesn't.
     type Part = { text: string; color?: string; dim?: boolean; press?: () => void }
     type Piece = { key: string; parts: Part[] }
@@ -1674,25 +1935,11 @@ export const register: Register = (on, options) => {
             ]),
           )
 
-    // Row 2: the branch with its diff against the main branch beside it (`+152 −32`, uncommitted work included),
-    // the milestone in the middle, and the session time on the right. When the row runs out of room the
-    // milestone's headline is cut, then left out, then its bar, then the milestone, then the diff.
-    const elapsed = started !== null ? fmtElapsed(t - started) : null
-    const diffShown = workOn && diffState?.kind === 'ok' && !diffState.clean
-    const diffNumbers = diffState?.kind === 'ok' ? [`+${diffState.added}`, `−${diffState.deleted}`] : []
-    const branchText = onBranch ? `⎇ ${onBranch}` : ''
-    // The branch, and with the diff two columns and the two numbers a column apart; `time 26m`. With the
-    // milestone in the middle both sides take the wider one's columns, so the middle sits at the true centre: two
-    // sides, a column either side of the middle, and the milestone.
-    const leftWidth = (diff: boolean): Width => ({
-      text: cells(branchText) + (diff ? diffNumbers.reduce((w, x) => w + cells(x), 0) : 0),
-      gaps: diff ? 1 + (onBranch ? 2 : 0) : 0,
-    })
-    const rightWidth: Width = { text: elapsed ? 4 + cells(elapsed) : 0, gaps: elapsed ? 1 : 0 }
-    const columns = (w: Width) => Math.ceil(w.text * scale) + w.gaps
-    const sideColumns = (diff: boolean) => Math.max(columns(leftWidth(diff)), columns(rightWidth))
-    // ms: the milestone being worked on, its title, a bar of its issues closed, the count and the headline of its
-    // description (`0.2.0 ██░░░░ 3/22 Agent rules and the merge loop`). Clicking the title opens it on GitHub.
+    // Row 1: the repository on the left (`londontypescript/fleet-street`, the owner bold and the name a link to the
+    // repository on GitHub, the folder after it when that's named otherwise) and the milestone being worked on on the right: its title, a bar of its issues closed, the count
+    // and the headline of its description (`0.2.0 ██░░░░ 3/22 Agent rules and the merge loop`), the title blue like
+    // the bar. Clicking the headline opens it on GitHub. When the row runs out of room the owner and the folder are left out,
+    // then the headline is cut, then left out, then the milestone's bar, then the milestone.
     const ms = workOn && prState?.kind === 'ok' ? (prState.milestone ?? null) : null
     const msStale = prState?.kind === 'ok' && prState.stale
     const msCount = ms ? `${ms.closed}/${ms.total}` : ''
@@ -1708,11 +1955,15 @@ export const register: Register = (on, options) => {
         gaps: 2 + (shape.bar ? 1 : 0) + (h ? 1 : 0),
       }
     }
-    const row2Fits = (diff: boolean, shape: MsShape) => {
-      if (!(shape && ms)) return columns(leftWidth(diff)) + 1 + columns(rightWidth) <= e.props.bodyColumns
-      const mid = msWidth(shape)
-      return 2 * sideColumns(diff) + 2 + mid.text * scale + mid.gaps <= e.props.bodyColumns
-    }
+    // The owner and the name a slash apart with no gap, the folder after a `·`. The owner is bold, which a desktop
+    // draws wider than its usual share: it's counted at full width, like the gaps.
+    const repoWidth = (full: boolean): Width =>
+      repo
+        ? {
+            text: cells(repo.name) + (full && repo.folder ? 1 + cells(repo.folder) : 0),
+            gaps: (full && repo.owner ? cells(repo.owner) + 1 : 0) + (full && repo.folder ? 2 : 0),
+          }
+        : { text: 0, gaps: 0 }
     const msShapes: MsShape[] = ms
       ? [
           ...(headline ? [Infinity, 32, 16].map(h => ({ bar: true, headline: h })) : []),
@@ -1720,22 +1971,26 @@ export const register: Register = (on, options) => {
           { bar: false, headline: 0 },
         ]
       : []
-    const row2Fit = [
-      ...msShapes.map(shape => ({ diff: diffShown, ms: shape })),
-      { diff: diffShown, ms: null },
-      { diff: false, ms: null },
-    ].find(c => row2Fits(c.diff, c.ms)) ?? { diff: false, ms: null }
+    const topFit = [
+      ...msShapes.slice(0, 1).map(shape => ({ full: true, ms: shape })),
+      ...(msShapes.length === 0 ? [{ full: true, ms: null }] : []),
+      ...msShapes.map(shape => ({ full: false, ms: shape })),
+      { full: false, ms: null },
+    ].find(c => {
+      const l = repoWidth(c.full)
+      const r = msWidth(c.ms)
+      return fits({ text: l.text + r.text, gaps: l.gaps + r.gaps + 1 })
+    }) ?? { full: false, ms: null }
     const msFilled = ms ? filledCells(ms.total === 0 ? 0 : (ms.closed / ms.total) * 100) : 0
+    const msHeadline = headlineText(topFit.ms)
     const msPart =
-      ms && row2Fit.ms ? (
-        <Box flexWrap="nowrap" columnGap={1}>
+      ms && topFit.ms ? (
+        <Box flexShrink={1} flexWrap="nowrap" columnGap={1}>
           <Text bold>ms</Text>
-          <Button key="ms" plain onPress={() => openUrl($, ms.url)}>
-            <Text color="cyan" dimColor={msStale}>
-              {ms.title}
-            </Text>
-          </Button>
-          {row2Fit.ms.bar ? (
+          <Text color="cyan" dimColor={msStale}>
+            {ms.title}
+          </Text>
+          {topFit.ms.bar ? (
             <Box>
               <Text color="cyan" dimColor={msStale}>
                 {'█'.repeat(msFilled)}
@@ -1744,11 +1999,137 @@ export const register: Register = (on, options) => {
             </Box>
           ) : null}
           <Text dimColor={msStale}>{msCount}</Text>
-          {headlineText(row2Fit.ms) ? <Text dimColor={msStale}>{headlineText(row2Fit.ms)}</Text> : null}
+          {/* A desktop pads a button for its hover outline; pulled into the padding, the text ends at the rule's end. */}
+          {msHeadline ? (
+            <Box marginRight={e.surface === 'terminal' ? 0 : -1}>
+              <Button key="ms-headline" label={msHeadline} plain dimColor={msStale} onPress={() => openUrl($, ms.url)} />
+            </Box>
+          ) : null}
         </Box>
       ) : null
-    const diffPart = row2Fit.diff ? (
+    // It keeps its width beside the milestone, which fits around it; alone and too wide, it's clipped (the link's
+    // hover outline with it, so only then). A desktop pads the link for its hover outline: pulled into the
+    // padding, the name meets the slash.
+    const repoUrl = repo?.owner ? `https://github.com/${repo.owner}/${repo.name}` : null
+    const repoClipped = !topFit.ms && !fits(repoWidth(false))
+    const repoPart = repo ? (
+      <Box flexShrink={topFit.ms ? 0 : 1} flexWrap="nowrap" columnGap={1}>
+        <Box flexWrap="nowrap" overflow={repoClipped ? 'hidden' : undefined}>
+          {topFit.full && repo.owner ? <Text bold>{repo.owner}/</Text> : null}
+          {repoUrl ? (
+            <Box marginLeft={e.surface === 'terminal' || !(topFit.full && repo.owner) ? 0 : -1}>
+              <Button key="repo" label={repo.name} plain dimColor onPress={() => openUrl($, repoUrl)} />
+            </Box>
+          ) : (
+            <Text dimColor wrap="truncate-end">
+              {repo.name}
+            </Text>
+          )}
+        </Box>
+        {topFit.full && repo.folder ? <Text dimColor>·</Text> : null}
+        {topFit.full && repo.folder ? <Text dimColor>{repo.folder}</Text> : null}
+      </Box>
+    ) : null
+    // A light rule under it makes it the banner's header. Twice the columns of dashes cover a desktop's
+    // proportional text; they stay on one line that runs past the edge, clipped there to the column (wrapped,
+    // they'd stop short by part of a dash; a truncating Text would add a `…`).
+    const topLine =
+      repoPart || msPart ? (
+        <Box width="100%" flexDirection="column">
+          <Box width="100%" flexWrap="nowrap" justifyContent="space-between" columnGap={1}>
+            {repoPart ?? <Box />}
+            {msPart}
+          </Box>
+          <Box width="100%" height={1} flexWrap="nowrap" overflow="hidden">
+            <Box flexShrink={0}>
+              <Text color="gray">{'─'.repeat(e.props.bodyColumns * 2)}</Text>
+            </Box>
+          </Box>
+        </Box>
+      ) : null
+
+    // Row 3: the branch with its diff against the main branch beside it (`8 files +152 −32`, uncommitted work
+    // included), the track Apple Music is playing (`♪ Song — Artist`) or else the date and time
+    // (`Sat 25 Oct 18:42`), and the session time on the right. With a diff the track or the date sits on the
+    // right beside the time, away from the diff; without one it's centred. The track is cut to the room left.
+    // When the row runs out of room the date is left out (keeping the time), then the middle (a track under 16
+    // cells), then the diff.
+    const elapsed = started !== null ? fmtElapsed(t - started) : null
+    const diffShown = workOn && diffState?.kind === 'ok' && !diffState.clean
+    const filesText = diffState?.kind === 'ok' ? `${diffState.files} ${diffState.files === 1 ? 'file' : 'files'}` : ''
+    const diffNumbers = diffState?.kind === 'ok' ? [`+${diffState.added}`, `−${diffState.deleted}`] : []
+    const branchText = onBranch ? `⎇ ${onBranch}` : ''
+    // Whether the diff is drawn: the file count and the lines, or none.
+    type DiffShape = 'files' | null
+    // The branch, and with the diff two columns and its parts a column apart; `time 26m`. Centred, the middle
+    // has both sides take the wider one's columns, so it sits at the true centre: two sides, a column either
+    // side of the middle, and the middle. On the right, it's the left side, a column, the middle, two columns
+    // and the time.
+    // A branch other than the main one is bold, which a desktop draws wider than its usual share: it's counted
+    // at full width, like the gaps.
+    const leftWidth = (d: DiffShape): Width => {
+      const shown = d === null ? [] : [filesText, ...diffNumbers]
+      const boldBranch = onBranch !== null && onBranch !== mainBranch
+      return {
+        text: (boldBranch ? 0 : cells(branchText)) + shown.reduce((w, x) => w + cells(x), 0),
+        gaps: (boldBranch ? cells(branchText) : 0) + (shown.length === 0 ? 0 : shown.length - 1 + (onBranch ? 2 : 0)),
+      }
+    }
+    const rightWidth: Width = { text: elapsed ? 4 + cells(elapsed) : 0, gaps: elapsed ? 1 : 0 }
+    const columns = (w: Width) => Math.ceil(w.text * scale) + w.gaps
+    const sideColumns = (d: DiffShape) => Math.max(columns(leftWidth(d)), columns(rightWidth))
+    // The columns a middle has around it: beside a diff it's on the right, else centred.
+    const aroundMiddle = (d: DiffShape) => (d === null ? 2 * sideColumns(d) + 2 : columns(leftWidth(d)) + 1 + 2 + columns(rightWidth))
+    // The middle's shapes beside a diff shape, widest first: each its parts a column apart. The track is cut to
+    // the cells left around it, less its mark (two cells: it's counted wide) and the gap after it; under 16
+    // cells, none.
+    const clock = new Date(t)
+    const hhmm = `${String(clock.getHours()).padStart(2, '0')}:${String(clock.getMinutes()).padStart(2, '0')}`
+    // The track in so many cells: the title cut first, keeping the artist whole while the title keeps 8 cells;
+    // narrower than that, the artist is cut too.
+    const trackIn = (room: number) => {
+      if (!playing) return ''
+      if (!playing.artist) return truncate(playing.title, room)
+      const by = ` — ${playing.artist}`
+      if (cells(playing.title) + cells(by) <= room) return `${playing.title}${by}`
+      if (room - cells(by) >= 8) return `${truncate(playing.title, room - cells(by))}${by}`
+      return `${truncate(playing.title, 8)} — ${truncate(playing.artist, room - 8 - 3)}`
+    }
+    const middleShapes = (d: DiffShape): Part[][] => {
+      if (!playing) {
+        return [
+          [{ text: `${DAYS[clock.getDay()]} ${clock.getDate()} ${MONTHS[clock.getMonth()]}`, dim: true }, { text: hhmm }],
+          [{ text: hhmm }],
+        ]
+      }
+      const room = Math.floor((e.props.bodyColumns - aroundMiddle(d) - 1) / scale) - cells('♪')
+      return room >= 16 ? [[{ text: '♪', color: 'magenta' }, { text: trackIn(room) }]] : []
+    }
+    const middleWidth = (m: Part[] | null): Width =>
+      m ? { text: m.reduce((w, x) => w + cells(x.text), 0), gaps: m.length - 1 } : { text: 0, gaps: 0 }
+    const row3Fits = (d: DiffShape, m: Part[] | null) => {
+      if (m === null) return columns(leftWidth(d)) + 1 + columns(rightWidth) <= e.props.bodyColumns
+      const mid = middleWidth(m)
+      return aroundMiddle(d) + mid.text * scale + mid.gaps <= e.props.bodyColumns
+    }
+    const row3Fit = [
+      ...(diffShown
+        ? [...middleShapes('files').map(m => ({ diff: 'files' as DiffShape, middle: m })), { diff: 'files' as DiffShape, middle: null }]
+        : middleShapes(null).map(m => ({ diff: null as DiffShape, middle: m }))),
+      { diff: null, middle: null },
+    ].find(c => row3Fits(c.diff, c.middle)) ?? { diff: null, middle: null }
+    const middlePart = row3Fit.middle ? (
       <Box flexWrap="nowrap" columnGap={1}>
+        {row3Fit.middle.map((x, i) => (
+          <Text key={`mid:${i}`} color={x.color} dimColor={x.dim}>
+            {x.text}
+          </Text>
+        ))}
+      </Box>
+    ) : null
+    const diffPart = row3Fit.diff ? (
+      <Box flexWrap="nowrap" columnGap={1}>
+        <Text dimColor>{filesText}</Text>
         <Text color="green">{diffNumbers[0]}</Text>
         <Text color="red">{diffNumbers[1]}</Text>
       </Box>
@@ -1756,8 +2137,9 @@ export const register: Register = (on, options) => {
     const branchPart =
       onBranch || diffPart ? (
         <Box flexWrap="nowrap" columnGap={2}>
+          {/* Clipped, never wrapped, should the estimate still fall short. */}
           {onBranch ? (
-            <Text color={onBranch === mainBranch ? 'green' : 'yellow'} bold={onBranch !== mainBranch}>
+            <Text color={onBranch === mainBranch ? 'green' : 'yellow'} bold={onBranch !== mainBranch} wrap="truncate-end">
               {branchText}
             </Text>
           ) : null}
@@ -1770,14 +2152,22 @@ export const register: Register = (on, options) => {
         <Text>{elapsed}</Text>
       </Box>
     ) : null
-    const side = sideColumns(row2Fit.diff)
-    const statusLine = msPart ? (
+    const side = sideColumns(row3Fit.diff)
+    const statusLine = middlePart && row3Fit.diff ? (
+      <Box width="100%" flexWrap="nowrap" justifyContent="space-between" columnGap={1}>
+        {branchPart}
+        <Box flexWrap="nowrap" columnGap={2}>
+          {middlePart}
+          {timePart}
+        </Box>
+      </Box>
+    ) : middlePart ? (
       <Box width="100%" flexWrap="nowrap" columnGap={1}>
         <Box width={side} flexShrink={0} flexWrap="nowrap">
           {branchPart}
         </Box>
         <Box flexGrow={1} flexWrap="nowrap" justifyContent="center">
-          {msPart}
+          {middlePart}
         </Box>
         <Box width={side} flexShrink={0} flexWrap="nowrap" justifyContent="flex-end">
           {timePart}
@@ -1789,6 +2179,38 @@ export const register: Register = (on, options) => {
         {timePart}
       </Box>
     ) : null
+
+    // subs: the desktop sessions this one started, those needing the person first, each by its name with a mark
+    // for what it's doing and how long since it last did anything. Clicking a name opens the session. Squeezed:
+    // names cut to 24, then 12, then counted by what they're doing (`● 3 working │ ○ 2 waiting │ ⚠ 1 needs you`),
+    // then tighter (`●3 ○2 ⚠1`).
+    const SUB_GROUPS = [
+      { status: 'working', mark: '●', word: 'working', color: 'yellow' },
+      { status: 'waiting', mark: '○', word: 'waiting', color: undefined },
+      { status: 'needsYou', mark: '⚠', word: 'needs you', color: 'red' },
+    ] as const
+    const subMark = (status: SubSession['status']): Part => {
+      const g = SUB_GROUPS.find(x => x.status === status)
+      return { text: g?.mark ?? '○', color: g?.color, dim: g?.color === undefined }
+    }
+    const subsOrdered = [...(subList ?? [])].sort((a, b) => Number(b.status === 'needsYou') - Number(a.status === 'needsYou'))
+    const subPiece = (x: SubSession, max: number): Piece => ({
+      key: x.id,
+      parts: [subMark(x.status), { text: truncate(x.name, max), press: () => openSession($, x.link) }, { text: fmtAgo(t - x.lastAt), dim: true }],
+    })
+    const subGroups = SUB_GROUPS.map(g => ({ ...g, n: subsOrdered.filter(x => x.status === g.status).length })).filter(g => g.n > 0)
+    const subsLine =
+      subsOrdered.length === 0
+        ? null
+        : fullLine(
+            listPart('subs', [
+              subsOrdered.map(x => subPiece(x, Infinity)),
+              subsOrdered.map(x => subPiece(x, 24)),
+              subsOrdered.map(x => subPiece(x, 12)),
+              subGroups.map(g => ({ key: `g:${g.status}`, parts: [subMark(g.status), { text: `${g.n} ${g.word}`, color: g.status === 'needsYou' ? g.color : undefined }] })),
+              [{ key: 'tight', parts: subGroups.map(g => ({ ...subMark(g.status), text: `${g.mark}${g.n}` })) }],
+            ]),
+          )
 
     // pr: the open PRs, each with its checks passed out of the total; drawn only while one is open.
     const prList = workOn && prState?.kind === 'ok' ? prState.prs : []
@@ -1914,22 +2336,25 @@ export const register: Register = (on, options) => {
         </Box>
       ) : null
 
-    if (!awayLine && !statusLine && !agLine && !bgLine && !wtLine && !prLine && !ciLine && !recentLine) {
+    if (!topLine && !awayLine && !statusLine && !subsLine && !agLine && !bgLine && !wtLine && !prLine && !ciLine && !recentLine) {
       return firstLine
     }
 
     // A blank line between rows while they all fit in the rows the band may take; packed tight when they don't,
     // so the list rows stay in view instead of scrolling behind the band's `n more`. Each row is one line but
-    // the recent-sessions cells, which take three; the blank lines go between rows.
-    const shown = [awayLine, statusLine, agLine, bgLine, wtLine, prLine, ciLine, recentLine].filter(Boolean).length + 1
-    const height = shown + (recentLine && sessions !== null && sessions.length > 0 ? 2 : 0)
+    // the top row, which takes two with its rule, and the recent-sessions cells, which take three; the blank
+    // lines go between rows.
+    const shown = [topLine, awayLine, statusLine, subsLine, agLine, bgLine, wtLine, prLine, ciLine, recentLine].filter(Boolean).length + 1
+    const height = shown + (topLine ? 1 : 0) + (recentLine && sessions !== null && sessions.length > 0 ? 2 : 0)
     const spacing = height + shown - 1 <= e.props.maxRows ? 1 : 0
 
     return (
       <Box width="100%" flexDirection="column" rowGap={spacing}>
+        {topLine}
         {firstLine}
         {awayLine}
         {statusLine}
+        {subsLine}
         {agLine}
         {bgLine}
         {wtLine}

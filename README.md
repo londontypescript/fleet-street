@@ -12,36 +12,63 @@ Usage and Status Banner Plugin for Claude
 
 ## What it shows
 
-- **Row 1: usage**, left to right
+- **Row 1: the repository**, left and right, with a light rule under it as the banner's header
+  - Left: the repository, as its GitHub owner (bold) and name (`londontypescript/fleet-street`); clicking the
+    name opens the repository on GitHub. Else its top
+    folder's name, else the session's folder outside a git repository. In a folder named otherwise (a
+    worktree's), the folder follows it: `fleet-street · pin-worktree`
+  - Right: `ms`, the milestone being worked on, with a bar, a count of its issues closed out of all of them,
+    and the headline of its description (`0.2.0 ██░░░░ 3/22 Agent rules and the merge loop`). The headline is
+    the description's words before its first colon and space (`: `), else its first sentence, with a footer after a `---` line
+    left out. The milestone is the one the `milestone` option names, else the open milestone with the lowest
+    version number (compared as versions, so `0.0.10` comes after `0.0.9`), else the open one made first; not
+    shown when the repository has no open milestone. The title is blue, like the bar. Clicking the headline
+    opens the milestone on GitHub. Read with `pr`'s refresh and needs the same
+  - When the row runs out of room, the owner and the folder are left out, then the headline is cut to 32, then
+    16, then left out, then the milestone's bar is left out, then the milestone
+- **Row 2: usage**, left to right
   - `5h`: 5-hour usage as a bar and a percentage, with the time until it resets
   - `week`: weekly usage, the same way
   - `ctx`: context used out of the window, as tokens and a percentage. It turns yellow at 70% or 300k tokens
     and red at 90% or 450k tokens, whichever comes first, so on a 1M window it warns when a session is worth
     handing over (`contextWarnTokens`, `contextHandoverTokens`)
   - `cache`: the prompt-cache countdown, yellow in the last five minutes and red in the last minute
-- **Row 2: status**, left to right
-  - Left: the git branch, green on the main branch and yellow on any other, with its diff beside it: the lines
-    added and deleted since the branch left the expected branch (`mainBranch`), uncommitted work and new files
-    included (the lines of the first 200 new files), as `+152 −32`, and not shown when there's nothing. It
-    compares with the merge-base of `HEAD` and `origin/<mainBranch>` (the local `<mainBranch>` when there's no
-    such remote branch), as the refs stand locally: nothing is fetched
-  - Middle: `ms`, the milestone being worked on, with a bar, a count of its issues closed out of all of them,
-    and the headline of its description (`0.2.0 ██░░░░ 3/22 Agent rules and the merge loop`). The headline is
-    the description's words before its first colon and space (`: `), else its first sentence, with a footer after a `---` line
-    left out. The milestone is the one the `milestone` option names, else the open milestone with the lowest
-    version number (compared as versions, so `0.0.10` comes after `0.0.9`), else the open one made first; not
-    shown when the repository has no open milestone. Clicking its title opens the milestone on GitHub. Read
-    with `pr`'s refresh and needs the same
+- **Row 3: status**, left to right
+  - Left: the git branch, green on the main branch and yellow on any other, with its diff beside it: the files
+    changed and the lines added and deleted since the branch left the expected branch (`mainBranch`),
+    uncommitted work and new files included (the lines of the first 200 new files), as `8 files +152 −32`, and
+    not shown when there's nothing. A renamed file counts once. It compares with the merge-base of `HEAD` and
+    `origin/<mainBranch>` (the local `<mainBranch>` when there's no such remote branch), as the refs stand
+    locally: nothing is fetched
+  - Middle: the track Apple Music is playing, as `♪ Song — Artist`, else the date and time (`Sat 25 Oct
+    18:42`, in the machine's time zone). Music is asked every five seconds through AppleScript (`osascript`),
+    on a Mac only; it isn't started to ask. The first time, macOS asks whether Claude may control Music
+    (System Settings → Privacy & Security → Automation); until it's allowed, the date shows
   - Right: `time`, how long the session has been running
-  - When the row runs out of room, the headline is cut to 32, then 16, then left out, then the milestone's bar
-    is left out, then the milestone, then the diff
-- **The list rows** below it each appear only while they have something to show, so a quiet session is two
+  - With a diff showing, the track (or the date and time) sits on the right beside `time`, away from the
+    diff; without one it's centred
+  - The track is cut to the room left: the title is cut and the artist kept whole
+    (`♪ Let's Go (feat. Yelawolf, Twi… — Trick Daddy`), and only with under 8 characters left for the title is
+    the artist cut too. The file count always shows with the diff. When the row runs out of room, the date is
+    left out (keeping the time), then the middle (a track that would be cut under 16 characters), then the
+    diff
+- **The list rows** below it each appear only while they have something to show, so a quiet session is three
   rows tall. Rows have a blank line between them while they all fit in the space the app gives the banner
   (at most half the terminal); when they wouldn't, they're packed tight. Each is a label and its entries; when a row runs out of room it is squeezed a step at a time, as
   each row's entry says (full titles first), and on a row too narrow even for its last step the row is left
   out. The label stays on the left and the entries are spread in columns across the rest of the width, each
   centred in its own, with `│` between them; the spare width is shared evenly, so a longer entry gets a wider
   column.
+  - `subs`: the desktop sessions this one started (its sub-sessions), not archived, those needing you first,
+    each by the short name it was started with (else its title), with a mark and how long since it last did
+    anything. Clicking a name opens the session. Each session's record in the desktop app names the session
+    that started it; what it's doing comes from the end of its transcript. `●` working: mid-turn. `⚠` needs
+    you: its turn ended blocked on you (its wrap-up said so), or it's held on a question, a plan to approve or
+    a session it offered. `○` waiting: between turns otherwise. A transcript untouched for 30 minutes counts
+    as waiting whatever its end says, as its session stopped without closing the turn. A permission prompt
+    can't be told from a long tool call, so it counts as working. Not shown in the terminal, which has no such
+    records. Squeezed: names cut to 24, then 12, then counted by what they're doing (`● 3 working │ ○ 2
+    waiting │ ⚠ 1 needs you`), then tighter (`●3 ○2 ⚠1`)
   - `ag`: this session's subagents, from Claude Code's own agent list, each with its description, its model and
     effort (`Opus High`, `Sonnet Med`, from its first step), a mark (`●` running, `○` waiting or idle, `✓` done, `✗` failed) and how long it has run. A finished
     one stays for two minutes. Background runs of ChatGPT through the Codex CLI (`codex-locked`, `codex exec`)
@@ -141,5 +168,5 @@ claude plugin validate .
 `/plugin-types` in Claude Code to write it before type-checking in an editor.
 
 The banner is drawn on terminal and desktop surfaces. The desktop surface uses proportional text, so a line's
-character count only estimates its width there (row 2 counts it at 85%); keep decorations to fixed,
+character count only estimates its width there (the rows count it at 85%); keep decorations to fixed,
 single-character pieces.
