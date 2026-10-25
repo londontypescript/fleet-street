@@ -19,6 +19,12 @@ export type Subagent = {
 export type Worktree = { path: string; name: string; branch: string | null; agent: boolean }
 
 export type RecentSession = { id: string; title: string; updatedAt: number; link: string }
+// A desktop session this one started (its sub-session), by the short name it was started with (else its title):
+// working mid-turn, waiting idle between turns, or needing the person (its turn ended blocked on them, or it
+// stopped on a question or a plan to approve); lastAt when it last did anything.
+export type SubSession = { id: string; name: string; link: string; status: 'working' | 'waiting' | 'needsYou'; lastAt: number }
+// The track Apple Music is playing.
+export type NowPlaying = { title: string; artist: string }
 
 // A PR's reported checks (or a workflow run's jobs): how many passed out of how many, the worst result among
 // them, whether any are still running (a failure outranks them in state, but they still want watching), and
@@ -52,8 +58,11 @@ export type PrState =
   | { kind: 'loading' }
   | { kind: 'ok'; prs: Pr[]; runs: CiRun[]; milestone: Milestone | null; stale: boolean }
   | { kind: 'unavailable'; reason: string }
-// The branch's lines added and deleted against the main branch, uncommitted work included.
-export type DiffState = { kind: 'ok'; added: number; deleted: number; clean: boolean } | { kind: 'unavailable' }
+// The branch's lines added and deleted against the main branch and the files they're in, uncommitted work included.
+export type DiffState = { kind: 'ok'; added: number; deleted: number; files: number; clean: boolean } | { kind: 'unavailable' }
+// The repository the session is in: its GitHub owner and name when origin is on github.com, else its top
+// folder's name (owner null); folder is the top folder's name when it isn't the name (a worktree's).
+export type RepoName = { owner: string | null; name: string; folder: string | null }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -69,6 +78,9 @@ declare module 'claude-code' {
       bgTasks: BgTask[]
       agents: Subagent[]
       recent: RecentSession[] | null
+      subs: SubSession[] | null
+      repoName: RepoName | null
+      nowPlaying: NowPlaying | null
       sessionsShown: boolean | null
       prs: PrState | null
       diff: DiffState | null
