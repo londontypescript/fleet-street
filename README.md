@@ -42,7 +42,7 @@ Usage and Status Banner Plugin for Claude
     locally: nothing is fetched
   - Middle: the track Apple Music is playing, as `♪ Song — Artist`, else the date and time (`Sat 25 Oct
     18:42`, in the machine's time zone). Music is asked every five seconds through AppleScript (`osascript`),
-    on a Mac only; it isn't started to ask. The first time, macOS asks whether Claude may control Music
+    on a Mac only; it isn't started to ask. Clicking the track brings Apple Music to the front. The first time, macOS asks whether Claude may control Music
     (System Settings → Privacy & Security → Automation); until it's allowed, the date shows
   - Right: `time`, how long the session has been running
   - With a diff showing, the track (or the date and time) sits on the right beside `time`, away from the

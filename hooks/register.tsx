@@ -625,6 +625,12 @@ let musicRunning = false
 let musicRetryAt = 0
 let musicShown = ''
 
+// Clicking the track brings Apple Music to the front.
+const openMusic = async ($: EngineInterface) => {
+  const ran = await $.process.run(['open', '-a', 'Music']).catch(() => null)
+  if (!ok(ran)) $.ui.toast('Could not open Apple Music')
+}
+
 async function refreshMusic($: EngineInterface) {
   if (musicRunning || Date.now() < musicRetryAt) return
   musicRunning = true
@@ -2103,7 +2109,7 @@ export const register: Register = (on, options) => {
         ]
       }
       const room = Math.floor((e.props.bodyColumns - aroundMiddle(d) - 1) / scale) - cells('♪')
-      return room >= 16 ? [[{ text: '♪', color: 'magenta' }, { text: trackIn(room) }]] : []
+      return room >= 16 ? [[{ text: '♪', color: 'magenta' }, { text: trackIn(room), press: () => openMusic($) }]] : []
     }
     const middleWidth = (m: Part[] | null): Width =>
       m ? { text: m.reduce((w, x) => w + cells(x.text), 0), gaps: m.length - 1 } : { text: 0, gaps: 0 }
@@ -2120,11 +2126,15 @@ export const register: Register = (on, options) => {
     ].find(c => row3Fits(c.diff, c.middle)) ?? { diff: null, middle: null }
     const middlePart = row3Fit.middle ? (
       <Box flexWrap="nowrap" columnGap={1}>
-        {row3Fit.middle.map((x, i) => (
-          <Text key={`mid:${i}`} color={x.color} dimColor={x.dim}>
-            {x.text}
-          </Text>
-        ))}
+        {row3Fit.middle.map((x, i) =>
+          x.press ? (
+            <Button key={`mid:${i}`} label={x.text} plain dimColor={x.dim} onPress={x.press} />
+          ) : (
+            <Text key={`mid:${i}`} color={x.color} dimColor={x.dim}>
+              {x.text}
+            </Text>
+          ),
+        )}
       </Box>
     ) : null
     const diffPart = row3Fit.diff ? (
