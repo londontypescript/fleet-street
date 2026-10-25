@@ -13,7 +13,8 @@ Usage and Status Banner Plugin for Claude
 ## What it shows
 
 - **Row 1: the repository**, left and right, with a light rule under it as the banner's header
-  - Left: the repository, as its GitHub owner and name (`londontypescript/fleet-street`), else its top
+  - Left: the repository, as its GitHub owner (bold) and name (`londontypescript/fleet-street`); clicking the
+    name opens the repository on GitHub. Else its top
     folder's name, else the session's folder outside a git repository. In a folder named otherwise (a
     worktree's), the folder follows it: `fleet-street · pin-worktree`
   - Right: `ms`, the milestone being worked on, with a bar, a count of its issues closed out of all of them,

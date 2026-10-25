@@ -1935,8 +1935,8 @@ export const register: Register = (on, options) => {
             ]),
           )
 
-    // Row 1: the repository on the left (`londontypescript/fleet-street`, the folder after it when that's named
-    // otherwise) and the milestone being worked on on the right: its title, a bar of its issues closed, the count
+    // Row 1: the repository on the left (`londontypescript/fleet-street`, the owner bold and the name a link to the
+    // repository on GitHub, the folder after it when that's named otherwise) and the milestone being worked on on the right: its title, a bar of its issues closed, the count
     // and the headline of its description (`0.2.0 ██░░░░ 3/22 Agent rules and the merge loop`), the title blue like
     // the bar. Clicking the headline opens it on GitHub. When the row runs out of room the owner and the folder are left out,
     // then the headline is cut, then left out, then the milestone's bar, then the milestone.
@@ -1955,12 +1955,13 @@ export const register: Register = (on, options) => {
         gaps: 2 + (shape.bar ? 1 : 0) + (h ? 1 : 0),
       }
     }
-    // The owner and the name a slash apart with no gap, the folder after a `·`.
+    // The owner and the name a slash apart with no gap, the folder after a `·`. The owner is bold, which a desktop
+    // draws wider than its usual share: it's counted at full width, like the gaps.
     const repoWidth = (full: boolean): Width =>
       repo
         ? {
-            text: (full && repo.owner ? cells(repo.owner) + 1 : 0) + cells(repo.name) + (full && repo.folder ? 1 + cells(repo.folder) : 0),
-            gaps: full && repo.folder ? 2 : 0,
+            text: cells(repo.name) + (full && repo.folder ? 1 + cells(repo.folder) : 0),
+            gaps: (full && repo.owner ? cells(repo.owner) + 1 : 0) + (full && repo.folder ? 2 : 0),
           }
         : { text: 0, gaps: 0 }
     const msShapes: MsShape[] = ms
@@ -2006,14 +2007,24 @@ export const register: Register = (on, options) => {
           ) : null}
         </Box>
       ) : null
-    // It keeps its width beside the milestone, which fits around it; alone and too wide, it's clipped.
+    // It keeps its width beside the milestone, which fits around it; alone and too wide, it's clipped (the link's
+    // hover outline with it, so only then). A desktop pads the link for its hover outline: pulled into the
+    // padding, the name meets the slash.
+    const repoUrl = repo?.owner ? `https://github.com/${repo.owner}/${repo.name}` : null
+    const repoClipped = !topFit.ms && !fits(repoWidth(false))
     const repoPart = repo ? (
       <Box flexShrink={topFit.ms ? 0 : 1} flexWrap="nowrap" columnGap={1}>
-        <Box flexWrap="nowrap">
-          {topFit.full && repo.owner ? <Text dimColor>{repo.owner}/</Text> : null}
-          <Text bold wrap="truncate-end">
-            {repo.name}
-          </Text>
+        <Box flexWrap="nowrap" overflow={repoClipped ? 'hidden' : undefined}>
+          {topFit.full && repo.owner ? <Text bold>{repo.owner}/</Text> : null}
+          {repoUrl ? (
+            <Box marginLeft={e.surface === 'terminal' || !(topFit.full && repo.owner) ? 0 : -1}>
+              <Button key="repo" label={repo.name} plain dimColor onPress={() => openUrl($, repoUrl)} />
+            </Box>
+          ) : (
+            <Text dimColor wrap="truncate-end">
+              {repo.name}
+            </Text>
+          )}
         </Box>
         {topFit.full && repo.folder ? <Text dimColor>·</Text> : null}
         {topFit.full && repo.folder ? <Text dimColor>{repo.folder}</Text> : null}
