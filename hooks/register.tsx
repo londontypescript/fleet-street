@@ -523,7 +523,9 @@ async function refreshSubs($: EngineInterface) {
 async function subStatus($: EngineInterface, r: SessionRecord): Promise<Pick<SubSession, 'status' | 'lastAt'>> {
   const turn = r.cliId && r.cwd ? await transcriptTurn($, r.cliId, r.cwd) : null
   const lastAt = Math.max(r.updatedAt, (r.cliId && turns.get(r.cliId)?.mtimeMs) || 0)
-  const status = turn?.turn === 'asking' ? 'needsYou' : turn?.turn === 'running' ? 'working' : r.needsUser ? 'needsYou' : 'waiting'
+  // A turn gone still mid-way didn't end in a wrap-up, so the record's flag is an older turn's.
+  const status =
+    turn?.turn === 'asking' ? 'needsYou' : turn?.turn === 'running' ? 'working' : r.needsUser && !turn?.stale ? 'needsYou' : 'waiting'
   return { status, lastAt }
 }
 
@@ -536,8 +538,9 @@ const asksPerson = (tool: { name?: unknown; input?: { initiation?: unknown } }) 
 // A transcript left untouched this long isn't mid-turn whatever its end says: its session stopped without
 // closing the turn (the app quit). A tool call that runs longer reads as waiting.
 const TURN_STALE_MS = 30 * 60_000
-// The end of a transcript is enough to tell where its turn stands.
-const TRANSCRIPT_TAIL_BYTES = 64 * 1024
+// The end of a transcript is enough to tell where its turn stands; when the end is one entry too large to
+// read whole (a big tool result), more of it is read, up to what a command's output may hold (4 MiB).
+const TRANSCRIPT_TAILS = [64 * 1024, 1024 * 1024, 4 * 1024 * 1024 - 1024]
 
 type Turn = 'running' | 'asking' | 'ended'
 // What each sub-session's transcript said, kept until the file changes; where each transcript is, once found.
@@ -570,52 +573,65 @@ async function transcriptPath($: EngineInterface, cliId: string, cwd: string) {
   return found
 }
 
-async function transcriptTurn($: EngineInterface, cliId: string, cwd: string): Promise<{ turn: Turn | null } | null> {
+// stale: a turn that reads as mid-turn but whose transcript has been still too long; it's no longer running.
+async function transcriptTurn($: EngineInterface, cliId: string, cwd: string): Promise<{ turn: Turn | null; stale: boolean } | null> {
   const path = await transcriptPath($, cliId, cwd)
   if (!path) return null
   const stat = await $.fs.stat(path).catch(() => undefined)
   if (!stat) return null
   let cached = turns.get(cliId)
   if (!cached || cached.mtimeMs !== stat.mtimeMs || cached.size !== stat.size) {
-    // tail reads just the end; where there's none (Windows) the whole file is read.
-    const tail = await $.process.run(['tail', '-c', String(TRANSCRIPT_TAIL_BYTES), path], { timeoutMs: 5000 }).catch(() => null)
-    const text = ok(tail) ? tail.stdout : await $.fs.read(path).catch(() => null)
-    cached = { mtimeMs: stat.mtimeMs, size: stat.size, turn: text === null ? null : turnOf(text) }
+    const turn = await readTurn($, path, stat.size)
+    // A read that failed is tried again next time, not kept.
+    if (turn === undefined) return null
+    cached = { mtimeMs: stat.mtimeMs, size: stat.size, turn }
     turns.set(cliId, cached)
   }
-  return { turn: cached.turn === 'running' && Date.now() - cached.mtimeMs >= TURN_STALE_MS ? 'ended' : cached.turn }
+  const stale = cached.turn === 'running' && Date.now() - cached.mtimeMs >= TURN_STALE_MS
+  return { turn: stale ? 'ended' : cached.turn, stale }
+}
+
+// The turn the end of a transcript tells, read with tail and more of it while it tells nothing (its last entry
+// is cut); where there's no tail (Windows) the whole file is read. undefined when it can't be read.
+async function readTurn($: EngineInterface, path: string, size: number): Promise<Turn | null | undefined> {
+  for (const bytes of TRANSCRIPT_TAILS) {
+    const tail = await $.process.run(['tail', '-c', String(bytes), path], { timeoutMs: 5000 }).catch(() => null)
+    if (tail === null || tail.exitCode !== 0) break
+    if (tail.isStdoutTruncated) return undefined
+    const turn = turnOf(tail.stdout)
+    if (turn !== null || size <= bytes) return turn
+  }
+  const text = await $.fs.read(path).catch(() => null)
+  return text === null ? undefined : turnOf(text)
 }
 
 // What Apple Music is playing, asked through AppleScript: the title and the artist a tab apart, nothing while it
-// isn't running (it isn't started to ask) or isn't playing. A stream without a track says nothing too.
+// isn't running (it isn't started to ask) or isn't playing. A stream without a track says nothing too; being
+// refused control of Music fails the script.
 const NOW_PLAYING_SCRIPT = [
   'if application "Music" is running then',
   'tell application "Music"',
+  'if player state is playing then',
   'try',
-  'if player state is playing then return (name of current track) & tab & (artist of current track)',
+  'return (name of current track) & tab & (artist of current track)',
   'end try',
+  'end if',
   'end tell',
   'end if',
   'return ""',
 ]
 let musicRunning = false
-// osascript is missing (not a Mac): never asked again. A failed answer (the person hasn't let Claude control
-// Music) is asked again a minute later.
-let musicOff = false
+// A failed answer (no osascript off a Mac, or Claude not yet let control Music) is asked again a minute later.
 let musicRetryAt = 0
 let musicShown = ''
 
 async function refreshMusic($: EngineInterface) {
-  if (musicOff || musicRunning || Date.now() < musicRetryAt) return
+  if (musicRunning || Date.now() < musicRetryAt) return
   musicRunning = true
   try {
     const ran = await $.process
       .run(['osascript', ...NOW_PLAYING_SCRIPT.flatMap(line => ['-e', line])], { timeoutMs: 5000 })
-      .catch(() => undefined)
-    if (ran === undefined) {
-      musicOff = true
-      return
-    }
+      .catch(() => null)
     let next: NowPlaying | null = null
     if (ok(ran)) {
       const [title = '', artist = ''] = ran.stdout.replace(/\r?\n$/, '').split('\t')
@@ -1990,11 +2006,14 @@ export const register: Register = (on, options) => {
           ) : null}
         </Box>
       ) : null
+    // It keeps its width beside the milestone, which fits around it; alone and too wide, it's clipped.
     const repoPart = repo ? (
-      <Box flexShrink={0} flexWrap="nowrap" columnGap={1}>
+      <Box flexShrink={topFit.ms ? 0 : 1} flexWrap="nowrap" columnGap={1}>
         <Box flexWrap="nowrap">
           {topFit.full && repo.owner ? <Text dimColor>{repo.owner}/</Text> : null}
-          <Text bold>{repo.name}</Text>
+          <Text bold wrap="truncate-end">
+            {repo.name}
+          </Text>
         </Box>
         {topFit.full && repo.folder ? <Text dimColor>·</Text> : null}
         {topFit.full && repo.folder ? <Text dimColor>{repo.folder}</Text> : null}
@@ -2033,11 +2052,14 @@ export const register: Register = (on, options) => {
     // The branch, and with the diff two columns and its parts a column apart; `time 26m`. With something in the
     // middle both sides take the wider one's columns, so the middle sits at the true centre: two sides, a column
     // either side of the middle, and the middle.
+    // A branch other than the main one is bold, which a desktop draws wider than its usual share: it's counted
+    // at full width, like the gaps.
     const leftWidth = (d: DiffShape): Width => {
       const shown = d === null ? [] : d === 'files' ? [filesText, ...diffNumbers] : diffNumbers
+      const boldBranch = onBranch !== null && onBranch !== mainBranch
       return {
-        text: cells(branchText) + shown.reduce((w, x) => w + cells(x), 0),
-        gaps: shown.length === 0 ? 0 : shown.length - 1 + (onBranch ? 2 : 0),
+        text: (boldBranch ? 0 : cells(branchText)) + shown.reduce((w, x) => w + cells(x), 0),
+        gaps: (boldBranch ? cells(branchText) : 0) + (shown.length === 0 ? 0 : shown.length - 1 + (onBranch ? 2 : 0)),
       }
     }
     const rightWidth: Width = { text: elapsed ? 4 + cells(elapsed) : 0, gaps: elapsed ? 1 : 0 }
@@ -2106,8 +2128,9 @@ export const register: Register = (on, options) => {
     const branchPart =
       onBranch || diffPart ? (
         <Box flexWrap="nowrap" columnGap={2}>
+          {/* Clipped, never wrapped, should the estimate still fall short. */}
           {onBranch ? (
-            <Text color={onBranch === mainBranch ? 'green' : 'yellow'} bold={onBranch !== mainBranch}>
+            <Text color={onBranch === mainBranch ? 'green' : 'yellow'} bold={onBranch !== mainBranch} wrap="truncate-end">
               {branchText}
             </Text>
           ) : null}
