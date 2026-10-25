@@ -625,6 +625,12 @@ let musicRunning = false
 let musicRetryAt = 0
 let musicShown = ''
 
+// Clicking the track brings Apple Music to the front.
+const openMusic = async ($: EngineInterface) => {
+  const ran = await $.process.run(['open', '-a', 'Music']).catch(() => null)
+  if (!ok(ran)) $.ui.toast('Could not open Apple Music')
+}
+
 async function refreshMusic($: EngineInterface) {
   if (musicRunning || Date.now() < musicRetryAt) return
   musicRunning = true
@@ -2083,6 +2089,8 @@ export const register: Register = (on, options) => {
     // The middle's shapes beside a diff shape, widest first: each its parts a column apart. The track is cut to
     // the cells left around it, less its mark (two cells: it's counted wide) and the gap after it; under 16
     // cells, none.
+    // A desktop pads a button a column each side for its hover outline: the clickable track takes them too.
+    const buttonPadding = e.surface === 'terminal' ? 0 : 2
     const clock = new Date(t)
     const hhmm = `${String(clock.getHours()).padStart(2, '0')}:${String(clock.getMinutes()).padStart(2, '0')}`
     // The track in so many cells: the title cut first, keeping the artist whole while the title keeps 8 cells;
@@ -2102,11 +2110,13 @@ export const register: Register = (on, options) => {
           [{ text: hhmm }],
         ]
       }
-      const room = Math.floor((e.props.bodyColumns - aroundMiddle(d) - 1) / scale) - cells('♪')
-      return room >= 16 ? [[{ text: '♪', color: 'magenta' }, { text: trackIn(room) }]] : []
+      const room = Math.floor((e.props.bodyColumns - aroundMiddle(d) - 1 - buttonPadding) / scale) - cells('♪')
+      return room >= 16 ? [[{ text: '♪', color: 'magenta' }, { text: trackIn(room), press: () => openMusic($) }]] : []
     }
     const middleWidth = (m: Part[] | null): Width =>
-      m ? { text: m.reduce((w, x) => w + cells(x.text), 0), gaps: m.length - 1 } : { text: 0, gaps: 0 }
+      m
+        ? { text: m.reduce((w, x) => w + cells(x.text), 0), gaps: m.length - 1 + (m.some(x => x.press) ? buttonPadding : 0) }
+        : { text: 0, gaps: 0 }
     const row3Fits = (d: DiffShape, m: Part[] | null) => {
       if (m === null) return columns(leftWidth(d)) + 1 + columns(rightWidth) <= e.props.bodyColumns
       const mid = middleWidth(m)
@@ -2120,11 +2130,15 @@ export const register: Register = (on, options) => {
     ].find(c => row3Fits(c.diff, c.middle)) ?? { diff: null, middle: null }
     const middlePart = row3Fit.middle ? (
       <Box flexWrap="nowrap" columnGap={1}>
-        {row3Fit.middle.map((x, i) => (
-          <Text key={`mid:${i}`} color={x.color} dimColor={x.dim}>
-            {x.text}
-          </Text>
-        ))}
+        {row3Fit.middle.map((x, i) =>
+          x.press ? (
+            <Button key={`mid:${i}`} label={x.text} plain dimColor={x.dim} onPress={x.press} />
+          ) : (
+            <Text key={`mid:${i}`} color={x.color} dimColor={x.dim}>
+              {x.text}
+            </Text>
+          ),
+        )}
       </Box>
     ) : null
     const diffPart = row3Fit.diff ? (
