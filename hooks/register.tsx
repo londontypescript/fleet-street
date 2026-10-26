@@ -559,22 +559,30 @@ async function publishActivity($: EngineInterface) {
   if (key === activityShown && (key === '0:0' || t - activityAt < ACTIVITY_BEAT_MS)) return
   const path = await activityPath($, await $.session.id())
   if (path === null) return
+  const a: Activity = { at: t, ag, bg: bg.length - runs }
+  // Noted only once written, so a failed write is tried again next time.
+  await $.fs.write(path, JSON.stringify(a))
   activityShown = key
   activityAt = t
-  const a: Activity = { at: t, ag, bg: bg.length - runs }
-  await $.fs.write(path, JSON.stringify(a)).catch(() => {})
 }
+
+// The last good copy of each session's file, for when a read finds it torn mid-write.
+const activityKnown = new Map<string, Activity>()
 
 async function readActivity($: EngineInterface, cliId: string): Promise<Activity | null> {
   const path = await activityPath($, cliId)
   if (path === null) return null
+  let a = activityKnown.get(cliId)
   try {
-    const a = JSON.parse(await $.fs.read(path)) as Activity
-    const fresh = typeof a?.at === 'number' && Date.now() - a.at < ACTIVITY_STALE_MS
-    return fresh && typeof a.ag === 'number' && typeof a.bg === 'number' ? a : null
+    const got = JSON.parse(await $.fs.read(path)) as Activity
+    if (typeof got?.at === 'number' && typeof got.ag === 'number' && typeof got.bg === 'number') {
+      a = got
+      activityKnown.set(cliId, got)
+    }
   } catch {
-    return null
+    // Missing, or torn: the last good copy stands in, until it too is stale.
   }
+  return a && Date.now() - a.at < ACTIVITY_STALE_MS ? a : null
 }
 
 // Tools whose call waits on the person: a question, a plan to approve, a session offered rather than started.

@@ -69,7 +69,8 @@ Usage and Status Banner Plugin for Claude
     has running to `fleet-street/activity/<session id>.json` in Claude's configuration folder, and again every
     30 seconds while anything runs; a file older than 90 seconds is ignored. `○` waiting: between turns
     otherwise. A transcript untouched for 30 minutes counts
-    as waiting whatever its end says, as its session stopped without closing the turn. A permission prompt
+    as waiting whatever its end says (or background, while its file says work is running), as its session
+    stopped without closing the turn. A permission prompt
     can't be told from a long tool call, so it counts as working. Not shown in the terminal, which has no such
     records. Squeezed: names cut to 24, then 12, then counted by what they're doing (`● 3 working │ ◐ 1
     background │ ○ 2 waiting │ ⚠ 1 needs you`), then tighter (`●3 ◐1 ○2 ⚠1`)
