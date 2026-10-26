@@ -20,9 +20,18 @@ export type Worktree = { path: string; name: string; branch: string | null; agen
 
 export type RecentSession = { id: string; title: string; updatedAt: number; link: string }
 // A desktop session this one started (its sub-session), by the short name it was started with (else its title):
-// working mid-turn, waiting idle between turns, or needing the person (its turn ended blocked on them, or it
-// stopped on a question or a plan to approve); lastAt when it last did anything.
-export type SubSession = { id: string; name: string; link: string; status: 'working' | 'waiting' | 'needsYou'; lastAt: number }
+// working mid-turn, busy in the background between turns (its own banner shows subagents or background tasks
+// running: ag and bg count them), waiting idle between turns, or needing the person (its turn ended blocked on
+// them, or it stopped on a question or a plan to approve); lastAt when it last did anything.
+export type SubSession = {
+  id: string
+  name: string
+  link: string
+  status: 'working' | 'background' | 'waiting' | 'needsYou'
+  lastAt: number
+  ag?: number
+  bg?: number
+}
 // The track Apple Music is playing.
 export type NowPlaying = { title: string; artist: string }
 

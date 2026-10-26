@@ -503,8 +503,7 @@ async function refreshSubs($: EngineInterface) {
     if (list && own) {
       next = []
       for (const r of list.filter(r => r.parent === own.id && !r.archived).sort((a, b) => a.createdAt - b.createdAt)) {
-        const { status, lastAt } = await subStatus($, r)
-        next.push({ id: r.id, name: r.spawnName ?? r.title, link: `claude://claude.ai/epitaxy/${r.id}`, status, lastAt })
+        next.push({ id: r.id, name: r.spawnName ?? r.title, link: `claude://claude.ai/epitaxy/${r.id}`, ...(await subStatus($, r)) })
       }
     }
     const key = JSON.stringify(next)
@@ -518,15 +517,72 @@ async function refreshSubs($: EngineInterface) {
 }
 
 // A sub-session mid-turn is working, unless the turn is held on a question for the person; one between turns
-// is waiting, unless its turn ended blocked on the person. It last did anything when its record or its
-// transcript last changed (the record isn't written mid-turn).
-async function subStatus($: EngineInterface, r: SessionRecord): Promise<Pick<SubSession, 'status' | 'lastAt'>> {
+// is waiting, unless its turn ended blocked on the person or its banner says it has work running in the
+// background. It last did anything when its record or its transcript last changed (the record isn't written
+// mid-turn).
+async function subStatus($: EngineInterface, r: SessionRecord): Promise<Pick<SubSession, 'status' | 'lastAt' | 'ag' | 'bg'>> {
   const turn = r.cliId && r.cwd ? await transcriptTurn($, r.cliId, r.cwd) : null
   const lastAt = Math.max(r.updatedAt, (r.cliId && turns.get(r.cliId)?.mtimeMs) || 0)
   // A turn gone still mid-way didn't end in a wrap-up, so the record's flag is an older turn's.
   const status =
     turn?.turn === 'asking' ? 'needsYou' : turn?.turn === 'running' ? 'working' : r.needsUser && !turn?.stale ? 'needsYou' : 'waiting'
+  if (status === 'waiting' && r.cliId) {
+    const a = await readActivity($, r.cliId)
+    if (a && a.ag + a.bg > 0) return { status: 'background', lastAt, ag: a.ag, bg: a.bg }
+  }
   return { status, lastAt }
+}
+
+// What a session has running beside its turns, for the session that started it to read: its subagents at work
+// and its background runs of another provider's agent (ag), and its background shells and monitors (bg), as its
+// own ag and bg rows count them. Each session writes its own file when that changes, and again every
+// ACTIVITY_BEAT_MS while anything runs; a file older than ACTIVITY_STALE_MS is from a session that stopped
+// without saying so (the app quit), and says nothing.
+type Activity = { at: number; ag: number; bg: number }
+const ACTIVITY_BEAT_MS = 30_000
+const ACTIVITY_STALE_MS = 90_000
+const AGENT_AT_WORK = new Set<Subagent['status']>(['running', 'pending', 'waiting'])
+let activityShown = ''
+let activityAt = 0
+
+const activityPath = async ($: EngineInterface, cliId: string) => {
+  const config = await configRoot($)
+  return config === null ? null : `${config}/fleet-street/activity/${cliId.replace(/[^A-Za-z0-9-]/g, '_')}.json`
+}
+
+async function publishActivity($: EngineInterface) {
+  const bg = await read($, bgTasks)
+  const runs = bg.filter(b => b.model).length
+  const ag = [...agentSeen.values()].filter(s => s.last && s.endedAt === undefined && AGENT_AT_WORK.has(s.last.status)).length + runs
+  const key = `${ag}:${bg.length - runs}`
+  const t = Date.now()
+  if (key === activityShown && (key === '0:0' || t - activityAt < ACTIVITY_BEAT_MS)) return
+  const path = await activityPath($, await $.session.id())
+  if (path === null) return
+  const a: Activity = { at: t, ag, bg: bg.length - runs }
+  // Noted only once written, so a failed write is tried again next time.
+  await $.fs.write(path, JSON.stringify(a))
+  activityShown = key
+  activityAt = t
+}
+
+// The last good copy of each session's file, for when a read finds it torn mid-write.
+const activityKnown = new Map<string, Activity>()
+
+async function readActivity($: EngineInterface, cliId: string): Promise<Activity | null> {
+  const path = await activityPath($, cliId)
+  if (path === null) return null
+  let a = activityKnown.get(cliId)
+  try {
+    const got = JSON.parse(await $.fs.read(path)) as Activity
+    if (typeof got?.at === 'number' && typeof got.ag === 'number' && typeof got.bg === 'number') {
+      a = got
+      activityKnown.set(cliId, got)
+    }
+  } catch {
+    // Missing, or torn: the last good copy stands in, until it too is stale.
+  }
+  return a && Date.now() - a.at < ACTIVITY_STALE_MS ? a : null
 }
 
 // Tools whose call waits on the person: a question, a plan to approve, a session offered rather than started.
@@ -945,7 +1001,7 @@ const MODEL_COLOR = '#f28c28'
 const AGENT_MARKS: Record<Subagent['status'], { mark: string; color: string | undefined; rank: number }> = {
   failed: { mark: '✗', color: 'red', rank: 4 },
   killed: { mark: '✗', color: 'red', rank: 4 },
-  running: { mark: '●', color: 'yellow', rank: 3 },
+  running: { mark: '●', color: 'cyan', rank: 3 },
   pending: { mark: '○', color: undefined, rank: 2 },
   waiting: { mark: '○', color: undefined, rank: 2 },
   idle: { mark: '○', color: undefined, rank: 1 },
@@ -954,8 +1010,8 @@ const AGENT_MARKS: Record<Subagent['status'], { mark: string; color: string | un
 // How each result is drawn, and which wins when a count stands for several PRs.
 const CHECK_MARKS: Record<Checks['state'], { mark: string; color: string | undefined; rank: number }> = {
   fail: { mark: '✗', color: 'red', rank: 4 },
-  running: { mark: '●', color: 'yellow', rank: 3 },
-  waiting: { mark: '○', color: 'yellow', rank: 2 },
+  running: { mark: '●', color: 'cyan', rank: 3 },
+  waiting: { mark: '○', color: 'cyan', rank: 2 },
   unknown: { mark: '?', color: undefined, rank: 1 },
   pass: { mark: '✓', color: 'green', rank: 0 },
 }
@@ -1522,6 +1578,7 @@ export const register: Register = (on, options) => {
       if (Math.floor(t / 1000) % 5 === 0) void refreshLocal($)
       // A safety net: subagents are refreshed as their steps and turns come.
       if (Math.floor(t / 1000) % 5 === 0) void refreshAgents($)
+      if (Math.floor(t / 1000) % 5 === 0) void publishActivity($).catch(() => {})
       // The shared files are read every five seconds; what they say decides when GitHub is asked.
       if (workVisible && Math.floor(t / 1000) % 5 === 0) void refreshPrs($)
       if (Math.floor(t / 1000) % 15 === 0) void refreshRecent($).catch(() => {})
@@ -2195,11 +2252,13 @@ export const register: Register = (on, options) => {
     ) : null
 
     // subs: the desktop sessions this one started, those needing the person first, each by its name with a mark
-    // for what it's doing and how long since it last did anything. Clicking a name opens the session. Squeezed:
-    // names cut to 24, then 12, then counted by what they're doing (`● 3 working │ ○ 2 waiting │ ⚠ 1 needs you`),
-    // then tighter (`●3 ○2 ⚠1`).
+    // for what it's doing and how long since it last did anything; one busy in the background says with what
+    // (`◐ gu-port 1x ag 2x bg`). Clicking a name opens the session. Squeezed: names cut to 24, then 12, then
+    // counted by what they're doing (`● 3 working │ ◐ 1 background │ ○ 2 waiting │ ⚠ 1 needs you`), then
+    // tighter (`●3 ◐1 ○2 ⚠1`).
     const SUB_GROUPS = [
-      { status: 'working', mark: '●', word: 'working', color: 'yellow' },
+      { status: 'working', mark: '●', word: 'working', color: 'cyan' },
+      { status: 'background', mark: '◐', word: 'background', color: 'cyan' },
       { status: 'waiting', mark: '○', word: 'waiting', color: undefined },
       { status: 'needsYou', mark: '⚠', word: 'needs you', color: 'red' },
     ] as const
@@ -2210,7 +2269,14 @@ export const register: Register = (on, options) => {
     const subsOrdered = [...(subList ?? [])].sort((a, b) => Number(b.status === 'needsYou') - Number(a.status === 'needsYou'))
     const subPiece = (x: SubSession, max: number): Piece => ({
       key: x.id,
-      parts: [subMark(x.status), { text: truncate(x.name, max), press: () => openSession($, x.link) }, { text: fmtAgo(t - x.lastAt), dim: true }],
+      parts: [
+        subMark(x.status),
+        { text: truncate(x.name, max), press: () => openSession($, x.link) },
+        ...(x.status === 'background'
+          ? [x.ag ? `${x.ag}x ag` : '', x.bg ? `${x.bg}x bg` : ''].filter(Boolean).map(text => ({ text, color: 'cyan' }))
+          : []),
+        { text: fmtAgo(t - x.lastAt), dim: true },
+      ],
     })
     const subGroups = SUB_GROUPS.map(g => ({ ...g, n: subsOrdered.filter(x => x.status === g.status).length })).filter(g => g.n > 0)
     const subsLine =
