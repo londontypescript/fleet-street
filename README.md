@@ -62,13 +62,17 @@ Usage and Status Banner Plugin for Claude
   - `subs`: the desktop sessions this one started (its sub-sessions), not archived, those needing you first,
     each by the short name it was started with (else its title), with a mark and how long since it last did
     anything. Clicking a name opens the session. Each session's record in the desktop app names the session
-    that started it; what it's doing comes from the end of its transcript. `●` working: mid-turn. `⚠` needs
+    that started it; what it's doing comes from the end of its transcript. `●` working (light blue): mid-turn. `⚠` needs
     you: its turn ended blocked on you (its wrap-up said so), or it's held on a question, a plan to approve or
-    a session it offered. `○` waiting: between turns otherwise. A transcript untouched for 30 minutes counts
+    a session it offered. `◐` background (light blue): between turns, but its own banner shows subagents or
+    background tasks running, counted after its name (`◐ gu-port 1x ag 2x bg`). Each session writes what it
+    has running to `fleet-street/activity/<session id>.json` in Claude's configuration folder, and again every
+    30 seconds while anything runs; a file older than 90 seconds is ignored. `○` waiting: between turns
+    otherwise. A transcript untouched for 30 minutes counts
     as waiting whatever its end says, as its session stopped without closing the turn. A permission prompt
     can't be told from a long tool call, so it counts as working. Not shown in the terminal, which has no such
-    records. Squeezed: names cut to 24, then 12, then counted by what they're doing (`● 3 working │ ○ 2
-    waiting │ ⚠ 1 needs you`), then tighter (`●3 ○2 ⚠1`)
+    records. Squeezed: names cut to 24, then 12, then counted by what they're doing (`● 3 working │ ◐ 1
+    background │ ○ 2 waiting │ ⚠ 1 needs you`), then tighter (`●3 ◐1 ○2 ⚠1`)
   - `ag`: this session's subagents, from Claude Code's own agent list, each with its description, its model and
     effort (`Opus High`, `Sonnet Med`, from its first step), a mark (`●` running, `○` waiting or idle, `✓` done, `✗` failed) and how long it has run. A finished
     one stays for two minutes. Background runs of ChatGPT through the Codex CLI (`codex-locked`, `codex exec`)
@@ -83,10 +87,10 @@ Usage and Status Banner Plugin for Claude
     cut to 24, then 12, then the first ones and `+N`, then `×N`
   - `pr`: the open pull requests whose branch is this session's branch or one of the worktrees' (this
     session's first; at most 10 branches are looked up). Each shows its number, its title and its checks as
-    passed out of the total: `● 2/4` yellow while any are running, `✗ 3/4` red as soon as one fails, `✓ 4/4`
+    passed out of the total: `● 2/4` light blue while any are running, `✗ 3/4` red as soon as one fails, `✓ 4/4`
     green when all pass (skipped and neutral checks count as passed). The total includes the checks the PR's
     base branch requires (by its rulesets or its branch protection, asked for every five minutes; an answer that can't be refreshed counts for 30 minutes) that haven't
-    reported yet; while any haven't and none failed or runs, it shows `○ 4/15` in yellow. A red `⚠` after the
+    reported yet; while any haven't and none failed or runs, it shows `○ 4/15` in light blue. A red `⚠` after the
     title means the PR conflicts with its base: GitHub doesn't start the workflows a `pull_request` event runs
     until the conflict is resolved, so those checks never come. A draft is dimmed. Clicking a title opens
     the PR; it shows as a button on hover. PRs from forks are left out. Each branch's PRs are asked for
